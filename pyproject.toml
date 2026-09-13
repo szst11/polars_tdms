@@ -1,0 +1,33 @@
+[project]
+name = "polars-tdms"
+version = "0.1.0"
+description = "A polars IO extension for reading TDMS files, backed by tdms-rs (Rust)."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "polars-lts-cpu>=1.33.1",
+]
+
+[project.optional-dependencies]
+bench = [
+    "nptdms>=1.9",
+    "pandas>=2.0",
+]
+dev = [
+    "maturin>=1.7,<2.0",
+    "numpy>=2.0",
+    "nptdms>=1.9",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "polars_tdms._core"
+python-source = "src"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
