@@ -30,6 +30,11 @@ import polars as pl
 
 from . import _core
 
+try:
+    import pyarrow as _pa
+except ImportError:  # pragma: no cover - optional fast path
+    _pa = None
+
 __version__ = _core.__version__
 
 __all__ = [
@@ -67,9 +72,9 @@ DTYPE_TO_POLARS: dict[str, pl.DataType] = {
     "TimeStamp": pl.Datetime("us"),
 }
 
-#: Channel data types whose samples can be loaded into columns (all POD types).
-#: String / TimeStamp channels are exposed in the metadata but their raw data
-#: is not decompressed by tdms-rs 2.x, so they are skipped when building frames.
+#: Channel data types whose samples can be loaded into columns (all POD types
+#: plus String). TimeStamp is exposed in the metadata but tdms-rs 2.x can't
+#: decode its raw data, so those channels are skipped when building frames.
 _READABLE_DTYPES = frozenset(
     {
         "I8",
@@ -83,6 +88,7 @@ _READABLE_DTYPES = frozenset(
         "Float",
         "Double",
         "Boolean",
+        "String",
     }
 )
 
@@ -240,12 +246,56 @@ def _series_from_numpy(name: str, arr: Any) -> pl.Series:
     return pl.Series(name, arr, strict=False)
 
 
-def _read_channel_series(
+def _series_from_string_buffers(name: str, offsets: bytes, data: bytes, n: int) -> pl.Series:
+    arr = _pa.Array.from_buffers(
+        _pa.large_string(),
+        n,
+        [None, _pa.py_buffer(offsets), _pa.py_buffer(data)],
+    )
+    return pl.Series(name, arr)
+
+
+def _arrow_dtype(name: str) -> Any:
+    return {
+        "I8": _pa.int8(),
+        "I16": _pa.int16(),
+        "I32": _pa.int32(),
+        "I64": _pa.int64(),
+        "U8": _pa.uint8(),
+        "U16": _pa.uint16(),
+        "U32": _pa.uint32(),
+        "U64": _pa.uint64(),
+        "Float": _pa.float32(),
+        "Double": _pa.float64(),
+        "Boolean": _pa.bool_(),
+    }[name]
+
+
+def _series_from_numeric_buffers(name: str, dtype: str, data: bytes, n: int) -> pl.Series:
+    arr = _pa.Array.from_buffers(_arrow_dtype(dtype), n, [None, _pa.py_buffer(data)])
+    return pl.Series(name, arr)
+
+
+def _read_numeric_channel_series(
     handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
 ) -> pl.Series:
-    if req.length == 0:
-        return pl.Series(req.name, [], dtype=DTYPE_TO_POLARS[req.dtype])
+    if chunk_size is None or chunk_size <= 0 or chunk_size >= req.length:
+        data = handle.read_channel_range_buffers(req.group, req.channel, 0, req.length)
+        return _series_from_numeric_buffers(req.name, req.dtype, data, req.length)
 
+    pieces: list[pl.Series] = []
+    for start in range(0, req.length, chunk_size):
+        end = min(start + chunk_size, req.length)
+        data = handle.read_channel_range_buffers(req.group, req.channel, start, end)
+        pieces.append(_series_from_numeric_buffers(req.name, req.dtype, data, end - start))
+    if len(pieces) == 1:
+        return pieces[0]
+    return pl.concat(pieces, rechunk=False)
+
+
+def _read_numeric_channel_series_numpy(
+    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
+) -> pl.Series:
     if chunk_size is None or chunk_size <= 0 or chunk_size >= req.length:
         arr = handle.read_channel_range(req.group, req.channel, 0, req.length)
         return _series_from_numpy(req.name, arr)
@@ -258,6 +308,59 @@ def _read_channel_series(
     if len(pieces) == 1:
         return pieces[0]
     return pl.concat(pieces, rechunk=False)
+
+
+def _read_string_channel_series(
+    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
+) -> pl.Series:
+    if chunk_size is None or chunk_size <= 0 or chunk_size >= req.length:
+        offsets, data = handle.read_channel_strings_buffers(
+            req.group, req.channel, 0, req.length
+        )
+        return _series_from_string_buffers(req.name, offsets, data, req.length)
+
+    pieces: list[pl.Series] = []
+    for start in range(0, req.length, chunk_size):
+        end = min(start + chunk_size, req.length)
+        offsets, data = handle.read_channel_strings_buffers(
+            req.group, req.channel, start, end
+        )
+        pieces.append(_series_from_string_buffers(req.name, offsets, data, end - start))
+    if len(pieces) == 1:
+        return pieces[0]
+    return pl.concat(pieces, rechunk=False)
+
+
+def _read_string_channel_series_list(
+    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
+) -> pl.Series:
+    if chunk_size is None or chunk_size <= 0 or chunk_size >= req.length:
+        vals = handle.read_channel_strings(req.group, req.channel, 0, req.length)
+        return pl.Series(req.name, vals, dtype=pl.Utf8)
+    pieces: list[pl.Series] = []
+    for start in range(0, req.length, chunk_size):
+        end = min(start + chunk_size, req.length)
+        vals = handle.read_channel_strings(req.group, req.channel, start, end)
+        pieces.append(pl.Series(req.name, vals, dtype=pl.Utf8))
+    if len(pieces) == 1:
+        return pieces[0]
+    return pl.concat(pieces, rechunk=False)
+
+
+def _read_channel_series(
+    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
+) -> pl.Series:
+    if req.length == 0:
+        return pl.Series(req.name, [], dtype=DTYPE_TO_POLARS[req.dtype])
+
+    if _pa is None:
+        if req.dtype == "String":
+            return _read_string_channel_series_list(handle, req, chunk_size)
+        return _read_numeric_channel_series_numpy(handle, req, chunk_size)
+
+    if req.dtype == "String":
+        return _read_string_channel_series(handle, req, chunk_size)
+    return _read_numeric_channel_series(handle, req, chunk_size)
 
 
 def _read_requested(

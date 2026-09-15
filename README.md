@@ -40,8 +40,10 @@ df = lf.select("DAQ/Ch0", "DAQ/Ch1").collect()
 
 ### Supported channel types
 
-Float32, Float64, Int8–Int64, UInt8–UInt64, Boolean, String, Timestamp (converted to
-`datetime`).
+Sample data: Float32, Float64, Int8–Int64, UInt8–UInt64, Boolean, String.
+TimeStamp channels are exposed in the metadata (properties converted to
+`datetime`) but tdms-rs 2.x does not decode their sample data, so they are
+skipped when building frames.
 
 ## API
 
@@ -54,51 +56,90 @@ Float32, Float64, Int8–Int64, UInt8–UInt64, Boolean, String, Timestamp (conv
 
 `group=None` merges all groups (channels prefixed with `GroupName/`).
 
-## Benchmark
+## Benchmarks
 
-Synthetic 64 MiB and 256 MiB TDMS files (`f64`, 8 channels), machine
-timed on the host. RSS measured as resident set of a fresh subprocess
-(after the read, result kept alive).
+All scripts live in `benchmarks/`. The two synthetic scripts accept
+`--skip-write` to reuse a previously generated file instead of rewriting it.
 
-### 1 M samples × 8 channels  (64 MiB data)
-
-```
-benchmark                                     nptdms  polars_tdms  ratio
----------------------------------------------------------------
-metadata (full file parse)                   0.051s      0.000s   873x
-full group read                              0.089s      0.034s   2.6x
-lazy scan_tdms().collect()                       —       0.032s      —
-partial read (2 channels)                    0.090s      0.009s   9.8x
-peak RSS (full read)                         150 MiB     130 MiB  1.2x
-peak RSS (partial read)                      150 MiB      84 MiB  1.8x
-```
-
-### 4 M samples × 8 channels  (256 MiB data)
-
-```
-benchmark                                     nptdms  polars_tdms  ratio
----------------------------------------------------------------
-metadata (full file parse)                   0.161s      0.000s   2623x
-full group read                              0.339s      0.125s   2.7x
-lazy scan_tdms().collect()                       —       0.123s      —
-partial read (2 channels)                    0.299s      0.032s   9.3x
-peak RSS (full read)                         333 MiB     313 MiB  1.1x
-peak RSS (partial read)                      333 MiB     130 MiB  2.6x
-```
-
-Run the benchmark yourself:
+| Script | Input | Measures |
+|---|---|---|
+| `bench_vs_nptdms.py` | synthetic f64 file | metadata, full/partial reads and peak RSS vs nptdms |
+| `bench_vs_numpy_fallback.py` | synthetic mixed-type file (Float64/Int32/Boolean/String, many segments) | pyarrow/"buffers" path vs numpy fallback and nptdms |
+| `bench_file_vs_nptdms.py` | an existing file + group (positional args) | pyarrow path vs nptdms, full/chunked/per-channel |
 
 ```bash
 uv run --extra bench python benchmarks/bench_vs_nptdms.py \
     --samples=4000000 --channels=8 --path=/tmp/bench.tdms
+
+uv run --all-extras python benchmarks/bench_vs_numpy_fallback.py \
+    --segments=200 --samples-per-segment=100000
+
+uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ
 ```
+
+Each script first verifies polars_tdms values against nptdms and only reports
+timings once the read is known to be correct.
+
+### Results (bench_vs_nptdms.py, 8 f64 channels)
+
+Synthetic 64 MiB and 256 MiB TDMS files, machine timed on the host. RSS
+measured as the resident set of a fresh subprocess (after the read, the result
+is kept alive).
+
+#### 1 M samples × 8 channels (64 MiB data)
+
+```
+benchmark                                     nptdms   polars_tdms   ratio
+--------------------------------------------------------------
+metadata (groups/channels/properties)         49.26ms      0.06ms    790x
+full group read                               0.071s      0.033s    2.1x
+lazy scan_tdms().collect()                        —        0.033s      —
+partial read (2 channels)                     0.070s      0.009s    8.2x
+peak RSS (full read)                          188 MiB     167 MiB    1.1x
+peak RSS (partial read)                       188 MiB     120 MiB    1.6x
+```
+
+#### 4 M samples × 8 channels (256 MiB data)
+
+```
+benchmark                                     nptdms   polars_tdms   ratio
+--------------------------------------------------------------
+metadata (groups/channels/properties)        160.89ms      0.10ms    1609x
+full group read                               0.264s      0.129s     2.1x
+lazy scan_tdms().collect()                        —        0.128s       —
+partial read (2 channels)                     0.269s      0.033s     8.2x
+peak RSS (full read)                          371 MiB     359 MiB     1.0x
+peak RSS (partial read)                       371 MiB     168 MiB     2.2x
+```
+
+The metadata row is reported in milliseconds. Numbers are from a host run and
+will vary by machine and file layout.
 
 ## Architecture
 
 | Layer | Location | Purpose |
 |---|---|---|
-| Rust core (`_core`) | `src/lib.rs` | PyO3 extension: opens `TdmsFile`, reads channels into numpy arrays. |
+| Rust core (`_core`) | `src/lib.rs` | PyO3 extension: opens `TdmsFile`, reads channels as numpy arrays or raw Arrow-layout byte buffers. |
 | Python API | `src/polars_tdms/__init__.py` | Lazy nodes via `map_batches`, metadata dataclasses, chunked reads. |
+
+Numeric/Boolean and String reads use zero-copy raw-byte (<code>read_channel_range_buffers</code> / <code>read_channel_strings_buffers</code>) paths built into `pl.Series` via pyarrow (`Array.from_buffers`); they fall back to numpy / Python-list construction when pyarrow is unavailable.
+
+### Zero-copy read path
+
+Channel samples cross into polars without an intermediate NumPy array being
+built:
+
+- The Rust core hands back buffers that already match Arrow's memory layout:
+  little-endian scalars for numeric channels (`read_channel_range_buffers`), a
+  packed LSB-first bitmap for Boolean, and for String channels (`read_channel_strings_buffers`)
+  a pair of buffers — cumulative `i64` offsets plus one contiguous UTF-8 block —
+  which is exactly the payload of an Arrow `LargeUtf8` array.
+- pyarrow wraps those buffers with `Array.from_buffers` and polars adopts the
+  resulting arrays directly; the only copies are the `PyBytes` marshalling
+  inside `_core` and pyarrow's import.
+- Chunked reads concatenate the per-chunk series with `rechunk=False`, so a
+  multi-GB channel streams into the frame without ever allocating a full-size
+  intermediate array.
 
 LazyFrame nodes use `validate_output_schema=False` (polars 1.33+); projection
 pushdown is verified (only requested columns are read from the file).
