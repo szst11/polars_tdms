@@ -124,9 +124,9 @@ fn read_channel_into_numpy(
 }
 
 /// Read a range of POD (numeric / boolean) samples from a channel as raw
-/// bytes in Arrow's native-endian layout: little-endian for numerics and a
-/// packed LSB-first bitmap for Boolean. Returns the data buffer of an Arrow
-/// `PrimitiveArray` / `BooleanArray`.
+/// bytes in Arrow's layout: explicit little-endian for numerics (regardless of
+/// host byte order) and a packed LSB-first bitmap for Boolean. Returns the
+/// data buffer of an Arrow `PrimitiveArray` / `BooleanArray`.
 fn read_channel_into_bytes(
     py: Python<'_>,
     channel: &TdmsChannel<'_>,
@@ -137,10 +137,19 @@ fn read_channel_into_bytes(
             let len = range.end - range.start;
             let mut buf: Vec<$ty> = vec![<$ty>::default(); len];
             channel.read(range, &mut buf).map_err(tdms_err)?;
-            let ptr = buf.as_ptr() as *const u8;
-            let slice =
-                unsafe { std::slice::from_raw_parts(ptr, len * std::mem::size_of::<$ty>()) };
-            PyBytes::new(py, slice).unbind()
+            if cfg!(target_endian = "little") {
+                let ptr = buf.as_ptr() as *const u8;
+                let slice = unsafe {
+                    std::slice::from_raw_parts(ptr, len * std::mem::size_of::<$ty>())
+                };
+                PyBytes::new(py, slice).unbind()
+            } else {
+                let mut out: Vec<u8> = Vec::with_capacity(len * std::mem::size_of::<$ty>());
+                for v in &buf {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                PyBytes::new(py, &out).unbind()
+            }
         }};
     }
     Ok(match channel.dtype() {
@@ -327,9 +336,11 @@ impl TdmsHandle {
         read_channel_into_numpy(py, &c, 0..c.len())
     }
 
-    /// Read a slice of POD samples as raw bytes in Arrow's native-endian
-    /// layout (bytes of each little-endian scalar; Boolean as a packed bitmap).
-    /// Bounds are `start..end` (end exclusive).
+    /// Read a slice of POD samples as raw bytes in Arrow's layout: little-
+    /// endian scalars regardless of host byte order, Boolean as a packed
+    /// bitmap. Bounds are `start..end` (end exclusive). On little-endian hosts
+    /// this is a zero-conversion pointer view; the big-endian path performs an
+    /// explicit `to_le_bytes` pass and is untestable on this project's LE CI.
     fn read_channel_range_buffers(
         &self,
         py: Python<'_>,
