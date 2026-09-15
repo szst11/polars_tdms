@@ -311,7 +311,7 @@ impl TdmsHandle {
             ));
         }
         let c = channel_by_name(&self.file, group, channel)?;
-        let mut offsets: Vec<u32> = Vec::new();
+        let mut offsets: Vec<u64> = Vec::new();
         let mut data: Vec<u8> = Vec::new();
         c.read_string_buffers(start..end, &mut offsets, &mut data)
             .map_err(tdms_err)?;
