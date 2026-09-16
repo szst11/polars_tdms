@@ -7,9 +7,7 @@ and per-channel reads. Channels whose samples are metadata-only (TimeStamp)
 are skipped, matching polars_tdms behaviour.
 
 Usage:
-    uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ
-    uv run --all-extras python benchmarks/bench_file_vs_nptdms.py file.tdms Sensors \
-        --columns Voltage Current --chunk-size=0
+    uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ    
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from typing import NamedTuple
 import numpy as np
 
 import polars_tdms as pt
-
+from nptdms import TdmsFile
 
 class _Req(NamedTuple):
     name: str
@@ -43,23 +41,21 @@ def timeit(fn, repeat=3, warmup=1):
     return best
 
 
-def _nptdms_read_group(path: str, group: str, channels: list[str]) -> None:
-    from nptdms import TdmsFile
-
-    f = TdmsFile.read(path)
-    for c in channels:
-        f[group][c][:]
+def _nptdms_read_group(path: str, group: str) -> None:    
+    with TdmsFile.open(path) as _nptdms_file:
+            selected_group_pandas_df = _nptdms_file[group].as_dataframe()
 
 
 def _nptdms_read_channel(path: str, group: str, channel: str) -> None:
-    _nptdms_read_group(path, group, [channel])
+    #_nptdms_read_group(path, group, [channel])
+    with TdmsFile.open(path) as _nptdms_file:
+            _channel_data = _nptdms_file[group][channel].as_dataframe()
 
 
 def _nptdms_read_group_chunked(
     path: str, group: str, channels: list[str], chunk: int, n: int
 ) -> None:
     """Read every channel in `chunk`-sized slices and rebuild the full arrays."""
-    from nptdms import TdmsFile
 
     if n <= 0:
         return
@@ -75,7 +71,6 @@ def _nptdms_read_group_chunked(
 
 def check_values(path: str, group: str, requests: list[_Req]) -> bool:
     """Assert every readable channel matches the nptdms reference exactly."""
-    from nptdms import TdmsFile
 
     df = pt.read_tdms(path, group=group)
     f = TdmsFile.read(path)
@@ -103,8 +98,7 @@ def check_values(path: str, group: str, requests: list[_Req]) -> bool:
 def bench(
     path: str,
     group: str,
-    requests: list[_Req],
-    chunk_size: int | None,
+    requests: list[_Req],    
     repeat: int,
     warmup: int,
 ) -> None:
@@ -120,21 +114,10 @@ def bench(
 
     if equal_length:
         channels = [r.channel for r in requests]
-        t_ours_full = timeit(lambda: pt.read_tdms(path, group=group), repeat, warmup)
-        t_ref_full = timeit(lambda: _nptdms_read_group(path, group, channels), repeat, warmup)
+        t_ours_full = timeit(lambda: pt.read_tdms(path, group=group,chunk_size=None), repeat, warmup)
+        t_ref_full = timeit(lambda: _nptdms_read_group(path, group), repeat, warmup)
         row("full group read", t_ours_full, t_ref_full)
 
-        if chunk_size:
-            n = requests[0].length
-            t_ours_chunk = timeit(
-                lambda: pt.read_tdms(path, group=group, chunk_size=chunk_size),
-                repeat, warmup,
-            )
-            t_ref_chunk = timeit(
-                lambda: _nptdms_read_group_chunked(path, group, channels, chunk_size, n),
-                repeat, warmup,
-            )
-            row(f"chunked read ({chunk_size})", t_ours_chunk, t_ref_chunk)
     else:
         print("channels differ in length, benchmarking per channel only ...")
 
@@ -169,8 +152,6 @@ def main() -> int:
     ap.add_argument("file", help="path to an existing .tdms file")
     ap.add_argument("group", help="group name to benchmark")
     ap.add_argument("--columns", nargs="*", help="restrict timing to these channels")
-    ap.add_argument("--chunk-size", type=int, default=100_000,
-                    help="chunk size for the chunked read row (0 disables it)")
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=1)
     args = ap.parse_args()
@@ -202,7 +183,7 @@ def main() -> int:
         return 1
 
     print("\n" + "─" * 30)
-    bench(path, args.group, requests, args.chunk_size or None, args.repeat, args.warmup)
+    bench(path, args.group, requests,  args.repeat, args.warmup)
     return 0
 
 
