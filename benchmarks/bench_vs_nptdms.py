@@ -73,14 +73,18 @@ def bench(path: str, group: str, channels: int) -> None:
     print(header)
     print("-" * len(header))
 
-    def row(name, nptdms_t, ours_t):
+    def row(name, nptdms_t, ours_t, unit="s"):
         ratio = nptdms_t / ours_t if ours_t else float("nan")
-        print(f"{name:<52}{nptdms_t:>12.3f}s{ours_t:>12.3f}s{ratio:>9.1f}x")
+        if unit == "ms":
+            n, o = f"{nptdms_t * 1000:>11.2f}ms", f"{ours_t * 1000:>11.2f}ms"
+        else:
+            n, o = f"{nptdms_t:>12.3f}s", f"{ours_t:>12.3f}s"
+        print(f"{name:<52}{n}{o}{ratio:>9.1f}x")
 
     # 1. metadata only  -----------------------------------------------------
     t_np_meta = timeit(lambda: _np_metadata(path))
     t_rs_meta = timeit(lambda: pt.read_metadata(path))
-    row("metadata (groups/channels/properties)", t_np_meta, t_rs_meta)
+    row("metadata (groups/channels/properties)", t_np_meta, t_rs_meta, unit="ms")
 
     # 2. full read ----------------------------------------------------------
     def np_full():

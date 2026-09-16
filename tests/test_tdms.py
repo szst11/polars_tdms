@@ -127,6 +127,10 @@ def test_projection_pushdown_only_loads_selected(tdms_file):
             self.calls.append((group, channel, start, end))
             return self._h.read_channel_range(group, channel, start, end)
 
+        def read_channel_range_buffers(self, group, channel, start, end):
+            self.calls.append((group, channel, start, end))
+            return self._h.read_channel_range_buffers(group, channel, start, end)
+
     src._handle = SpyHandle(real)
     df = src.scan(group="Sensors").select("Current").collect()
     assert df.schema == {"Current": pl.Int32}
@@ -201,17 +205,168 @@ def test_differing_lengths_raises():
         pt.read_tdms(path, group="G")
 
 
-def test_string_channel_is_metadata_only():
+def test_string_channel_roundtrip():
     path = "/tmp/opencode/_str_ch.tdms"
     with TdmsWriter(path) as w:
         ch = ChannelObject("G", "Label", ["a", "bb", "ccc"])
         w.write_segment([GroupObject("G"), ch])
-    meta = pt.read_metadata(path)
-    label = meta.group("G").channel("Label")
+    df = pt.read_tdms(path, group="G")
+    assert df.shape == (3, 1)
+    assert df.schema == {"Label": pl.Utf8}
+    assert df["Label"].to_list() == ["a", "bb", "ccc"]
+
+
+def test_string_channel_buffers_path():
+    path = "/tmp/opencode/_str_buf.tdms"
+    with TdmsWriter(path) as w:
+        w.write_segment(
+            [GroupObject("G"), ChannelObject("G", "Label", ["ec", "", "a\U0001F600c"])]
+        )
+
+    src = pt.TdmsSource(path)
+    real = src._handle
+
+    class SpyHandle:
+        def __init__(self, h):
+            self._h = h
+            self.buffer_calls = 0
+            self.list_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._h, name)
+
+        def read_channel_strings_buffers(self, *a):
+            self.buffer_calls += 1
+            return self._h.read_channel_strings_buffers(*a)
+
+        def read_channel_strings(self, *a):
+            self.list_calls += 1
+            return self._h.read_channel_strings(*a)
+
+    src._handle = SpyHandle(real)
+    if pt._pa is not None:
+        df = src.read(group="G")
+        assert df["Label"].to_list() == ["ec", "", "a\U0001F600c"]
+        assert df.schema["Label"] == pl.Utf8
+        assert src._handle.buffer_calls > 0
+
+        offs, data = real.read_channel_strings_buffers("G", "Label", 0, 3)
+        n = len(offs) // 8 - 1
+        assert n == 3
+        import struct
+
+        parsed = []
+        for i in range(n):
+            s, e = struct.unpack_from("<qq", offs, i * 8)
+            parsed.append(data[s:e].decode("utf-8"))
+        assert parsed == ["ec", "", "a\U0001F600c"]
+    else:
+        df = src.read(group="G")
+        assert src._handle.list_calls > 0
+
+
+def test_mixed_group_with_string_channel(tmp_path):
+    path = tmp_path / "mixed.tdms"
+    with TdmsWriter(path) as w:
+        w.write_segment(
+            [
+                GroupObject("G"),
+                ChannelObject("G", "Sig", np.arange(3.0)),
+                ChannelObject("G", "Label", ["a", "bb", "ccc"]),
+            ]
+        )
+
+    df = pt.read_tdms(path, group="G")
+    assert set(df.columns) == {"Sig", "Label"}
+    assert df.schema["Sig"] == pl.Float64
+    assert df.schema["Label"] == pl.Utf8
+    assert df["Sig"].to_list() == [0.0, 1.0, 2.0]
+    assert df["Label"].to_list() == ["a", "bb", "ccc"]
+
+    label = pt.read_metadata(path).group("G").channel("Label")
     assert label.dtype == "String"
-    assert not label.readable
-    with pytest.raises(ValueError, match="no readable channel data"):
-        pt.read_tdms(path, group="G")
+    assert label.readable
+    assert label.length == 3
+
+
+def test_string_chunked_and_scan():
+    path = "/tmp/opencode/_str_scan.tdms"
+    strs = [f"s{i:04d}" for i in range(10)]
+    with TdmsWriter(path) as w:
+        w.write_segment([GroupObject("G"), ChannelObject("G", "Label", strs)])
+
+    lf = pt.scan_tdms(path, group="G")
+    assert lf.collect_schema() == {"Label": pl.Utf8}
+    assert lf.filter(pl.col("Label").str.starts_with("s00")).collect()["Label"].to_list() == strs
+
+    whole = pt.read_tdms(path, group="G")
+    chunked = pt.read_tdms(path, group="G", chunk_size=3)
+    single = pt.read_tdms(path, group="G", chunk_size=None)
+    assert whole.equals(chunked)
+    assert whole.equals(single)
+    assert chunked["Label"].to_list() == strs
+
+
+def test_numeric_buffer_path(tmp_path):
+    import struct
+
+    path = tmp_path / "numeric.tdms"
+    with TdmsWriter(path) as w:
+        w.write_segment(
+            [
+                GroupObject("G"),
+                ChannelObject("G", "F", np.array([1.5, -2.5, 3.25], dtype=np.float32)),
+                ChannelObject(
+                    "G",
+                    "B",
+                    np.array([True, True, False, True, False, False, False, True, True]),
+                ),
+            ]
+        )
+
+    src = pt.TdmsSource(path)
+    real = src._handle
+
+    class SpyHandle:
+        def __init__(self, h):
+            self._h = h
+            self.numpy_calls = 0
+            self.buffer_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._h, name)
+
+        def read_channel_range(self, *a):
+            self.numpy_calls += 1
+            return self._h.read_channel_range(*a)
+
+        def read_channel_range_buffers(self, *a):
+            self.buffer_calls += 1
+            return self._h.read_channel_range_buffers(*a)
+
+    src._handle = SpyHandle(real)
+    if pt._pa is not None:
+        df = src.read(group="G", columns=["F"])
+        assert df["F"].to_list() == [1.5, -2.5, 3.25]
+        assert df.schema["F"] == pl.Float32
+        assert src._handle.buffer_calls > 0
+        assert src._handle.numpy_calls == 0
+
+        raw = real.read_channel_range_buffers("G", "F", 0, 3)
+        vals = struct.unpack("<3f", raw)
+        assert vals == (1.5, -2.5, 3.25)
+
+    assert src.read(group="G", columns=["B"])["B"].to_list() == [
+        True,
+        True,
+        False,
+        True,
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
 
 
 def test_unknown_group_error(tdms_file):

@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "A polars IO extension for reading TDMS files, backed by tdms-rs (Rust)."
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["polars"
+dependencies = [
+    "polars",
+    "pyarrow>=15.0",
 ]
 
 [project.optional-dependencies]
@@ -30,3 +32,8 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pyarrow>=25.0.1",
+]
