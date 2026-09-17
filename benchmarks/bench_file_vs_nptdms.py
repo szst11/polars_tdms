@@ -174,7 +174,7 @@ def main() -> int:
     print(f"file: {path} ({path.stat().st_size / 1e6:.1f} MB)")
     print(f"group: {args.group} · channels: "
           f"{', '.join(f'{r.channel}({r.dtype})' for r in requests)}")
-    print("pyarrow path: " + ("enabled" if pt._pa is not None else "FALLBACK (numpy)"))
+    print("pyarrow path: enabled")
     print(f"samples: {requests[0].length}")
 
     print("\ncorrectness vs nptdms:")

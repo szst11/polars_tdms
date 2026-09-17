@@ -225,7 +225,7 @@ requires-dist = [
     { name = "nptdms", marker = "extra == 'dev'", specifier = ">=1.9" },
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "pandas", marker = "extra == 'bench'", specifier = ">=2.0" },
-    { name = "polars-lts-cpu", specifier = ">=1.33.1" },
+    { name = "polars-lts-cpu" },
     { name = "pyarrow", specifier = ">=15.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
 ]

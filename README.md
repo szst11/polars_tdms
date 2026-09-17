@@ -64,14 +64,14 @@ All scripts live in `benchmarks/`. The two synthetic scripts accept
 | Script | Input | Measures |
 |---|---|---|
 | `bench_vs_nptdms.py` | synthetic f64 file | metadata, full/partial reads and peak RSS vs nptdms |
-| `bench_vs_numpy_fallback.py` | synthetic mixed-type file (Float64/Int32/Boolean/String, many segments) | pyarrow/"buffers" path vs numpy fallback and nptdms |
+| `bench_vs_nptdms_mixed.py` | synthetic mixed-type file (Float64/Int32/Boolean/String, many segments) | pyarrow read path vs nptdms, full group and per-channel |
 | `bench_file_vs_nptdms.py` | an existing file + group (positional args) | pyarrow path vs nptdms, full/chunked/per-channel |
 
 ```bash
 uv run --extra bench python benchmarks/bench_vs_nptdms.py \
     --samples=4000000 --channels=8 --path=/tmp/bench.tdms
 
-uv run --all-extras python benchmarks/bench_vs_numpy_fallback.py \
+uv run --all-extras python benchmarks/bench_vs_nptdms_mixed.py \
     --segments=200 --samples-per-segment=100000
 
 uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ
@@ -119,10 +119,10 @@ will vary by machine and file layout.
 
 | Layer | Location | Purpose |
 |---|---|---|
-| Rust core (`_core`) | `src/lib.rs` | PyO3 extension: opens `TdmsFile`, reads channels as numpy arrays or raw Arrow-layout byte buffers. |
+| Rust core (`_core`) | `src/lib.rs` | PyO3 extension: opens `TdmsFile`, reads channels as raw Arrow-layout byte buffers. |
 | Python API | `src/polars_tdms/__init__.py` | Lazy nodes via `map_batches`, metadata dataclasses, chunked reads. |
 
-Numeric/Boolean and String reads use zero-copy raw-byte (<code>read_channel_range_buffers</code> / <code>read_channel_strings_buffers</code>) paths built into `pl.Series` via pyarrow (`Array.from_buffers`); they fall back to numpy / Python-list construction when pyarrow is unavailable.
+Numeric/Boolean and String reads use zero-copy raw-byte (<code>read_channel_range_buffers</code> / <code>read_channel_strings_buffers</code>) paths built into `pl.Series` via pyarrow (`Array.from_buffers`); pyarrow is a required dependency.
 
 ### Zero-copy read path
 

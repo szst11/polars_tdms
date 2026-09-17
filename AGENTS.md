@@ -19,18 +19,18 @@ Three scripts; all verify polars_tdms values against nptdms before reporting tim
 
 ```bash
 uv run --extra bench python benchmarks/bench_vs_nptdms.py --samples=4000000 --channels=8 --path=/tmp/bench.tdms
-uv run --all-extras python benchmarks/bench_vs_numpy_fallback.py --segments=200 --samples-per-segment=100000
+uv run --all-extras python benchmarks/bench_vs_nptdms_mixed.py --segments=200 --samples-per-segment=100000
 uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ
 ```
 
 - `bench_vs_nptdms.py` — synthetic f64 file; metadata/full/partial reads + peak RSS (RSS measured in a fresh subprocess via `benchmarks/_rss_runner.py`). Its metadata row is printed in **ms**.
-- `bench_vs_numpy_fallback.py` — synthetic mixed-type file (f64/i32/bool/string, many segments); tables the pyarrow/"buffers" fast path against the numpy fallback and nptdms. Needs pyarrow (`--all-extras`).
-- `bench_file_vs_nptdms.py` — positional `FILE GROUP` args; pyarrow path vs nptdms per channel. `--columns` restricts channels, `--chunk-size 0` disables the chunked row, exits 1 on a missing file/group.
+- `bench_vs_nptdms_mixed.py` — synthetic mixed-type file (f64/i32/bool/string, many segments); pyarrow read path vs nptdms for full group and per-channel reads.
+- `bench_file_vs_nptdms.py` — positional `FILE GROUP` args; pyarrow path vs nptdms per channel. `--columns` restricts channels, exits 1 on a missing file/group.
 
 ## Architecture & constraints worth knowing
 
-- Rust core (`src/lib.rs`, crate `polars-tdms-core`) exposes `TdmsHandle`; all channel reads cross the boundary as numpy arrays via `read_channel_range(group, channel, start, end)` (end-exclusive). Numeric channels default to `read_channel_range_buffers` → raw little-endian bytes (Boolean as a packed LSB bitmap) → pyarrow `Array.from_buffers` → `pl.Series`, no numpy; falls back to the numpy path when pyarrow is unavailable.
-- String/TimeStamp channel *data*: TimeStamp is metadata-only — tdms-rs 2.x can't decode it, gated by `_READABLE_DTYPES` in `__init__.py`. Reading one from Rust raises `NotImplementedError`; reading only these → `ValueError: no readable channel data`. String channels *are* readable via `read_channel_strings` (returns `Vec<String>` → Python list → `pl.Series`, no numpy). A second path uses `read_channel_strings_buffers` → `(i64-LE offsets, UTF-8 bytes)` consumed by pyarrow `Array.from_buffers` → `pl.Series` (zero-copy beyond the PyBytes copy in `_core`); falls back to the list path when pyarrow is unavailable, requires pyarrow ≥ 15 in deps. The tdms-rs upstream API behind it is `read_string_buffers(range, &mut Vec<u64>, &mut Vec<u8>)` (cumulative 64-bit offsets + one contiguous UTF-8 block, Arrow string layout).
+- Rust core (`src/lib.rs`, crate `polars-tdms-core`) exposes `TdmsHandle`; channel reads cross the boundary as raw Arrow-layout buffers only (no numpy). Numeric channels use `read_channel_range_buffers(group, channel, start, end)` (end-exclusive) → raw little-endian bytes (Boolean as a packed LSB bitmap) → pyarrow `Array.from_buffers` → `pl.Series`.
+- String/TimeStamp channel *data*: TimeStamp is metadata-only — tdms-rs 2.x can't decode it, gated by `_READABLE_DTYPES` in `__init__.py`. Reading one from Rust raises `NotImplementedError`; reading only these → `ValueError: no readable channel data`. String channels are read via `read_channel_strings_buffers` → `(i64-LE offsets, UTF-8 bytes)` consumed by pyarrow `Array.from_buffers` → `pl.Series` (zero-copy beyond the PyBytes copy in `_core`); requires pyarrow ≥ 15 in deps. The tdms-rs upstream API behind it is `read_string_buffers(range, &mut Vec<u64>, &mut Vec<u8>)` (cumulative 64-bit offsets + one contiguous UTF-8 block, Arrow string layout).
 - TimeStamp *properties* arrive from Rust as `(seconds, fraction)` tuples (fraction in 2^64ths); `_convert_property` turns them into datetimes (TDMS epoch 1904-01-01). Keep that conversion on the Python side.
 - Lazy reads use `placeholder.lazy().map_batches(...)` with `projection_pushdown=True`, `predicate_pushdown=False`, `slice_pushdown=False`, `streamable=False`, `validate_output_schema=False`. Projection pushdown is behavior-tested (`test_projection_pushdown_only_loads_selected` uses a spy handle) — preserve it.
 - `validate_output_schema` requires polars ≥ 1.33 (pinned via `polars-lts-cpu>=1.33.1`).

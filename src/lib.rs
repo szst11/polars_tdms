@@ -1,4 +1,3 @@
-use numpy::ToPyArray;
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -83,46 +82,6 @@ fn properties_to_dict<'a>(
     Ok(d.unbind())
 }
 
-/// Read a range of POD (numeric / boolean) samples from a channel into a NumPy array.
-fn read_channel_into_numpy(
-    py: Python<'_>,
-    channel: &TdmsChannel<'_>,
-    range: Range<usize>,
-) -> PyResult<Py<PyAny>> {
-    macro_rules! read_typed {
-        ($ty:ty) => {{
-            let len = range.end - range.start;
-            let mut buf: Vec<$ty> = vec![<$ty>::default(); len];
-            channel.read(range, &mut buf).map_err(tdms_err)?;
-            buf.to_pyarray(py).into_any().unbind()
-        }};
-    }
-    Ok(match channel.dtype() {
-        DataType::I8 => read_typed!(i8),
-        DataType::I16 => read_typed!(i16),
-        DataType::I32 => read_typed!(i32),
-        DataType::I64 => read_typed!(i64),
-        DataType::U8 => read_typed!(u8),
-        DataType::U16 => read_typed!(u16),
-        DataType::U32 => read_typed!(u32),
-        DataType::U64 => read_typed!(u64),
-        DataType::Float => read_typed!(f32),
-        DataType::Double => read_typed!(f64),
-        DataType::Boolean => read_typed!(bool),
-        DataType::String => {
-            return Err(PyNotImplementedError::new_err(
-                "String channels must be read via read_channel_strings",
-            ))
-        }
-        DataType::TimeStamp => {
-            return Err(PyNotImplementedError::new_err(format!(
-                "channel data type {dt:?} cannot be read as samples (metadata only)",
-                dt = channel.dtype()
-            )))
-        }
-    })
-}
-
 /// Read a range of POD (numeric / boolean) samples from a channel as raw
 /// bytes in Arrow's layout: explicit little-endian for numerics (regardless of
 /// host byte order) and a packed LSB-first bitmap for Boolean. Returns the
@@ -177,7 +136,7 @@ fn read_channel_into_bytes(
         }
         DataType::String => {
             return Err(PyNotImplementedError::new_err(
-                "String channels must be read via read_channel_strings",
+                "String channels must be read via read_channel_strings_buffers",
             ))
         }
         DataType::TimeStamp => {
@@ -255,44 +214,6 @@ impl TdmsHandle {
         Ok(meta.unbind())
     }
 
-    /// Read a slice of channels samples. Returns a NumPy array with the
-    /// channel's native dtype. Bounds are `start..end` (end exclusive).
-    fn read_channel_range(
-        &self,
-        py: Python<'_>,
-        group: &str,
-        channel: &str,
-        start: usize,
-        end: usize,
-    ) -> PyResult<Py<PyAny>> {
-        if end < start {
-            return Err(PyValueError::new_err(
-                "read_channel_range: end must be >= start",
-            ));
-        }
-        let c = channel_by_name(&self.file, group, channel)?;
-        read_channel_into_numpy(py, &c, start..end)
-    }
-
-    fn read_channel_strings(
-        &self,
-        group: &str,
-        channel: &str,
-        start: usize,
-        end: usize,
-    ) -> PyResult<Vec<String>> {
-        if end < start {
-            return Err(PyValueError::new_err(
-                "read_channel_strings: end must be >= start",
-            ));
-        }
-        let c = channel_by_name(&self.file, group, channel)?;
-        let len = end - start;
-        let mut out = vec![String::new(); len];
-        c.read_strings(start..end, &mut out).map_err(tdms_err)?;
-        Ok(out)
-    }
-
     /// Read a range of string samples as Arrow string buffers: cumulative
     /// i64 offsets (little-endian) followed by the concatenated UTF-8 bytes.
     /// Returns `(offsets, data)`. The two buffers are exactly the payload of an
@@ -323,17 +244,6 @@ impl TdmsHandle {
             PyBytes::new(py, &wide_offsets).unbind(),
             PyBytes::new(py, &data).unbind(),
         ))
-    }
-
-    /// Read the full channel. Returns a NumPy array.
-    fn read_channel(
-        &self,
-        py: Python<'_>,
-        group: &str,
-        channel: &str,
-    ) -> PyResult<Py<PyAny>> {
-        let c = channel_by_name(&self.file, group, channel)?;
-        read_channel_into_numpy(py, &c, 0..c.len())
     }
 
     /// Read a slice of POD samples as raw bytes in Arrow's layout: little-

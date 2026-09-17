@@ -5,13 +5,10 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import polars_tdms as pt
 import pytest
 from nptdms import TdmsWriter, ChannelObject, GroupObject
 
 BENCH_DIR = Path(__file__).resolve().parent.parent / "benchmarks"
-
-NEEDS_PYARROW = pytest.mark.skipif(pt._pa is None, reason="pyarrow fast path not available")
 
 
 def _run_script(name: str, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
@@ -43,24 +40,22 @@ def mixed_file(tmp_path_factory):
     return path
 
 
-@NEEDS_PYARROW
-def test_bench_vs_numpy_fallback_runs(tmp_path):
+def test_bench_vs_nptdms_mixed_runs(tmp_path):
     path = tmp_path / "bench_mixed.tdms"
     res = _run_script(
-        "bench_vs_numpy_fallback.py",
+        "bench_vs_nptdms_mixed.py",
         ["--segments=3", "--samples-per-segment=2000", f"--path={path}"],
     )
     assert res.returncode == 0, res.stderr
     out = res.stdout
-    assert "chunked==whole: True" in out
     for marker in (
-        "buffers/pyarrow",
-        "numpy fallback",
+        "correctness vs nptdms",
+        "matches nptdms: True",
+        "polars_tdms",
         "nptdms",
-        "vs nptdms",
         "full group read",
-        "chunked read (10k)",
-        "sig_f64 (Float64)",
+        "per-channel breakdown",
+        "sig_f64 (Double)",
         "label (String)",
     ):
         assert marker in out, f"missing {marker!r} in output:\n{out}"
@@ -76,7 +71,6 @@ def test_bench_file_vs_nptdms_runs(mixed_file, tmp_path):
         "Label(String)",
         "matches nptdms: True",
         "full group read",
-        "chunked read (100000)",
         "per-channel breakdown",
         "polars_tdms",
         "nptdms",
@@ -100,7 +94,7 @@ def test_bench_file_vs_nptdms_columns(tmp_path):
         )
     res = _run_script(
         "bench_file_vs_nptdms.py",
-        [str(path), "G", "--columns", "B", "--chunk-size", "0"],
+        [str(path), "G", "--columns", "B"],
     )
     assert res.returncode == 0, res.stderr
     out = res.stdout

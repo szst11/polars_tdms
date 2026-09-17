@@ -5,7 +5,8 @@ description = "A polars IO extension for reading TDMS files, backed by tdms-rs (
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "polars",
+    #"polars",
+    "polars-lts-cpu",
     "pyarrow>=15.0",
 ]
 

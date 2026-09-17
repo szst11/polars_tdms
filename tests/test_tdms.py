@@ -123,10 +123,6 @@ def test_projection_pushdown_only_loads_selected(tdms_file):
         def __getattr__(self, name):
             return getattr(self._h, name)
 
-        def read_channel_range(self, group, channel, start, end):
-            self.calls.append((group, channel, start, end))
-            return self._h.read_channel_range(group, channel, start, end)
-
         def read_channel_range_buffers(self, group, channel, start, end):
             self.calls.append((group, channel, start, end))
             return self._h.read_channel_range_buffers(group, channel, start, end)
@@ -230,7 +226,6 @@ def test_string_channel_buffers_path():
         def __init__(self, h):
             self._h = h
             self.buffer_calls = 0
-            self.list_calls = 0
 
         def __getattr__(self, name):
             return getattr(self._h, name)
@@ -239,30 +234,22 @@ def test_string_channel_buffers_path():
             self.buffer_calls += 1
             return self._h.read_channel_strings_buffers(*a)
 
-        def read_channel_strings(self, *a):
-            self.list_calls += 1
-            return self._h.read_channel_strings(*a)
-
     src._handle = SpyHandle(real)
-    if pt._pa is not None:
-        df = src.read(group="G")
-        assert df["Label"].to_list() == ["ec", "", "a\U0001F600c"]
-        assert df.schema["Label"] == pl.Utf8
-        assert src._handle.buffer_calls > 0
+    df = src.read(group="G")
+    assert df["Label"].to_list() == ["ec", "", "a\U0001F600c"]
+    assert df.schema["Label"] == pl.Utf8
+    assert src._handle.buffer_calls > 0
 
-        offs, data = real.read_channel_strings_buffers("G", "Label", 0, 3)
-        n = len(offs) // 8 - 1
-        assert n == 3
-        import struct
+    offs, data = real.read_channel_strings_buffers("G", "Label", 0, 3)
+    n = len(offs) // 8 - 1
+    assert n == 3
+    import struct
 
-        parsed = []
-        for i in range(n):
-            s, e = struct.unpack_from("<qq", offs, i * 8)
-            parsed.append(data[s:e].decode("utf-8"))
-        assert parsed == ["ec", "", "a\U0001F600c"]
-    else:
-        df = src.read(group="G")
-        assert src._handle.list_calls > 0
+    parsed = []
+    for i in range(n):
+        s, e = struct.unpack_from("<qq", offs, i * 8)
+        parsed.append(data[s:e].decode("utf-8"))
+    assert parsed == ["ec", "", "a\U0001F600c"]
 
 
 def test_mixed_group_with_string_channel(tmp_path):
@@ -330,31 +317,24 @@ def test_numeric_buffer_path(tmp_path):
     class SpyHandle:
         def __init__(self, h):
             self._h = h
-            self.numpy_calls = 0
             self.buffer_calls = 0
 
         def __getattr__(self, name):
             return getattr(self._h, name)
-
-        def read_channel_range(self, *a):
-            self.numpy_calls += 1
-            return self._h.read_channel_range(*a)
 
         def read_channel_range_buffers(self, *a):
             self.buffer_calls += 1
             return self._h.read_channel_range_buffers(*a)
 
     src._handle = SpyHandle(real)
-    if pt._pa is not None:
-        df = src.read(group="G", columns=["F"])
-        assert df["F"].to_list() == [1.5, -2.5, 3.25]
-        assert df.schema["F"] == pl.Float32
-        assert src._handle.buffer_calls > 0
-        assert src._handle.numpy_calls == 0
+    df = src.read(group="G", columns=["F"])
+    assert df["F"].to_list() == [1.5, -2.5, 3.25]
+    assert df.schema["F"] == pl.Float32
+    assert src._handle.buffer_calls > 0
 
-        raw = real.read_channel_range_buffers("G", "F", 0, 3)
-        vals = struct.unpack("<3f", raw)
-        assert vals == (1.5, -2.5, 3.25)
+    raw = real.read_channel_range_buffers("G", "F", 0, 3)
+    vals = struct.unpack("<3f", raw)
+    assert vals == (1.5, -2.5, 3.25)
 
     assert src.read(group="G", columns=["B"])["B"].to_list() == [
         True,
