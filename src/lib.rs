@@ -5,7 +5,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::IntoPyObject;
 use std::ops::Range;
 use tdms_rs::api::reader::TdmsChannel;
-use tdms_rs::{DataType, PropertyValue, TdmsError, TdmsFile};
+use tdms_rs::{DataType, OpenOptions, PropertyValue, TdmsError, TdmsFile};
 
 fn tdms_err(e: TdmsError) -> PyErr {
     PyValueError::new_err(format!("TDMS error: {e}"))
@@ -197,8 +197,19 @@ struct TdmsHandle {
 #[pymethods]
 impl TdmsHandle {
     #[new]
-    fn new(path: &str) -> PyResult<Self> {
-        let file = TdmsFile::open(path).map_err(tdms_err)?;
+    #[pyo3(signature = (path, use_index_file=true, create_index_if_missing=true, verify_index=false))]
+    fn new(
+        path: &str,
+        use_index_file: bool,
+        create_index_if_missing: bool,
+        verify_index: bool,
+    ) -> PyResult<Self> {
+        let file = OpenOptions::new()
+            .use_index_file(use_index_file)
+            .create_index_if_missing(create_index_if_missing)
+            .verify_index(verify_index)
+            .open(path)
+            .map_err(tdms_err)?;
         Ok(Self { file })
     }
 

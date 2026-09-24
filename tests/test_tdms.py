@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import numpy as np
 import polars as pl
@@ -372,3 +373,101 @@ def test_numeric_buffer_path(tmp_path):
 def test_unknown_group_error(tdms_file):
     with pytest.raises(ValueError, match="not found"):
         pt.read_tdms(tdms_file, group="Missing")
+
+
+def _write_single_channel(tmp_path: object, name: str = "sig.tdms"):
+    path = tmp_path / name
+    with TdmsWriter(path) as w:
+        w.write_segment([GroupObject("G"), ChannelObject("G", "A", np.arange(5.0))])
+    return path
+
+
+def _index_path(path: object) -> object:
+    return path.with_suffix(path.suffix + "_index")
+
+
+def test_default_open_generates_index_file(tmp_path):
+    path = _write_single_channel(tmp_path)
+    idx = _index_path(path)
+    assert not os.path.exists(idx)
+
+    df = pt.read_tdms(path, group="G")
+    assert df["A"].to_list() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert os.path.exists(idx)
+    with open(idx, "rb") as f:
+        assert f.read(4) == b"TDSh"
+
+    again = pt.read_tdms(path, group="G")
+    assert again.equals(df)
+
+
+def test_create_index_if_missing_false(tmp_path):
+    path = _write_single_channel(tmp_path)
+    idx = _index_path(path)
+    df = pt.read_tdms(path, group="G", create_index_if_missing=False)
+    assert df["A"].to_list() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert not os.path.exists(idx)
+
+
+def test_use_index_file_false_ignores_index(tmp_path):
+    path = _write_single_channel(tmp_path)
+    idx = _index_path(path)
+    idx.write_bytes(b"bogus")
+
+    df = pt.read_tdms(path, group="G", use_index_file=False)
+    assert df["A"].to_list() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert idx.read_bytes() == b"bogus"
+
+
+def test_corrupt_index_falls_back_and_regenerates(tmp_path):
+    path = _write_single_channel(tmp_path)
+    idx = _index_path(path)
+    pt.read_tdms(path, group="G")
+    idx.write_bytes(b"corrupt index, not a valid tdms index")
+
+    df = pt.read_tdms(path, group="G")
+    assert df["A"].to_list() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    with open(idx, "rb") as f:
+        assert f.read(4) == b"TDSh"
+
+
+def test_stale_index_falls_back_and_regenerates(tmp_path):
+    path = _write_single_channel(tmp_path)
+    idx = _index_path(path)
+    pt.read_tdms(path, group="G")
+
+    # Age the index into the past so the data file looks newer than it
+    # (a stale index must never be trusted).
+    past = os.path.getmtime(path) - 100
+    os.utime(idx, (past, past))
+
+    df = pt.read_tdms(path, group="G")
+    assert df["A"].to_list() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+    # The stale index was regenerated and is now current with the data file.
+    assert os.path.getmtime(idx) >= os.path.getmtime(path)
+
+
+def test_verify_index_true_passes_on_matching_index(tmp_path):
+    path = _write_single_channel(tmp_path)
+    pt.read_tdms(path, group="G")
+    df = pt.read_tdms(path, group="G", verify_index=True)
+    assert df["A"].to_list() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_verify_index_true_raises_on_mismatch(tmp_path):
+    path = _write_single_channel(tmp_path, name="a.tdms")
+    other = tmp_path / "b.tdms"
+    with TdmsWriter(other) as w:
+        w.write_segment(
+            [GroupObject("G"), ChannelObject("G", "A", np.arange(3, dtype=np.int32))]
+        )
+    pt.read_tdms(other, group="G")
+
+    target = _index_path(path)
+    os.replace(_index_path(other), target)
+    new_mtime = os.path.getmtime(path) + 100
+    os.utime(target, (new_mtime, new_mtime))
+
+    with pytest.raises(ValueError, match="index"):
+        pt.read_tdms(path, group="G", verify_index=True)

@@ -387,11 +387,27 @@ class TdmsSource:
     Opening only parses the metadata (the same work as :func:`read_metadata`);
     raw samples are read on demand. Use it as a context manager, or drop it to
     release the underlying file handle.
+
+    The metadata index can come from a sibling ``<file>.tdms_index`` companion
+    file (see the ``use_index_file`` / ``create_index_if_missing`` /
+    ``verify_index`` parameters).
     """
 
-    def __init__(self, path: str | os.PathLike[str]):
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        use_index_file: bool = True,
+        create_index_if_missing: bool = True,
+        verify_index: bool = False,
+    ):
         self._path = os.fspath(path)
-        self._handle: _core.TdmsHandle | None = _core.TdmsHandle(self._path)
+        self._handle: _core.TdmsHandle | None = _core.TdmsHandle(
+            self._path,
+            use_index_file=use_index_file,
+            create_index_if_missing=create_index_if_missing,
+            verify_index=verify_index,
+        )
         self._metadata: TdmsMetadata | None = None
 
     @property
@@ -481,14 +497,48 @@ class TdmsSource:
         self.close()
 
 
-def open_tdms(path: str | os.PathLike[str]) -> TdmsSource:
-    """Open a TDMS file, indexing its metadata immediately."""
-    return TdmsSource(path)
+def open_tdms(
+    path: str | os.PathLike[str],
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
+) -> TdmsSource:
+    """Open a TDMS file, indexing its metadata immediately.
+
+    When a sibling ``<file>.tdms_index`` companion file exists (and
+    ``use_index_file`` is true) it is used for the metadata index, so opening
+    never scans the raw data. A missing, empty, stale, or corrupt index is
+    skipped in favor of the data file and (when ``create_index_if_missing``)
+    regenerated best-effort. ``verify_index`` re-parses both files and raises
+    ``ValueError`` on mismatch.
+    """
+    return TdmsSource(
+        path,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+    )
 
 
-def read_metadata(path: str | os.PathLike[str]) -> TdmsMetadata:
-    """Read the full TDMS metadata without loading any raw channel data."""
-    with TdmsSource(path) as src:
+def read_metadata(
+    path: str | os.PathLike[str],
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
+) -> TdmsMetadata:
+    """Read the full TDMS metadata without loading any raw channel data.
+
+    See :func:`open_tdms` for the ``use_index_file`` / ``create_index_if_missing``
+    / ``verify_index`` options.
+    """
+    with TdmsSource(
+        path,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+    ) as src:
         return src.metadata
 
 
@@ -497,13 +547,24 @@ def scan_tdms(
     group: str | Sequence[str] | None = None,
     columns: Sequence[str] | None = None,
     chunk_size: int | None = DEFAULT_CHUNK_SIZE,
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
 ) -> pl.LazyFrame:
     """Lazily scan a TDMS file as a ``pl.LazyFrame``.
 
     Only metadata is parsed up front; channel data is read when the frame is
-    collected (see :meth:`TdmsSource.scan` for the parameters).
+    collected (see :meth:`TdmsSource.scan` for the parameters). See
+    :func:`open_tdms` for the ``use_index_file`` / ``create_index_if_missing``
+    / ``verify_index`` options.
     """
-    return TdmsSource(path).scan(group=group, columns=columns, chunk_size=chunk_size)
+    return TdmsSource(
+        path,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+    ).scan(group=group, columns=columns, chunk_size=chunk_size)
 
 
 def read_tdms(
@@ -511,6 +572,22 @@ def read_tdms(
     group: str | Sequence[str] | None = None,
     columns: Sequence[str] | None = None,
     chunk_size: int | None = DEFAULT_CHUNK_SIZE,
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
 ) -> pl.DataFrame:
-    """Eagerly read a TDMS group into a ``pl.DataFrame``."""
-    return scan_tdms(path, group=group, columns=columns, chunk_size=chunk_size).collect()
+    """Eagerly read a TDMS group into a ``pl.DataFrame``.
+
+    See :func:`open_tdms` for the ``use_index_file`` / ``create_index_if_missing``
+    / ``verify_index`` options.
+    """
+    return scan_tdms(
+        path,
+        group=group,
+        columns=columns,
+        chunk_size=chunk_size,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+    ).collect()

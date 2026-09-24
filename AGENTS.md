@@ -21,11 +21,13 @@ Three scripts; all verify polars_tdms values against nptdms before reporting tim
 uv run --extra bench python benchmarks/bench_vs_nptdms.py --samples=4000000 --channels=8 --path=/tmp/bench.tdms
 uv run --all-extras python benchmarks/bench_vs_numpy_fallback.py --segments=200 --samples-per-segment=100000
 uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ
+uv run --all-extras python benchmarks/bench_tdms_index.py --n-files=100 --samples=200000 --segments=200
 ```
 
 - `bench_vs_nptdms.py` — synthetic f64 file; metadata/full/partial reads + peak RSS (RSS measured in a fresh subprocess via `benchmarks/_rss_runner.py`). Its metadata row is printed in **ms**.
 - `bench_vs_numpy_fallback.py` — synthetic mixed-type file (f64/i32/bool/string, many segments); tables the pyarrow/"buffers" fast path against the numpy fallback and nptdms. Needs pyarrow (`--all-extras`).
 - `bench_file_vs_nptdms.py` — positional `FILE GROUP` args; pyarrow path vs nptdms per channel. `--columns` restricts channels, `--chunk-size 0` disables the chunked row, exits 1 on a missing file/group.
+- `bench_tdms_index.py` — N synthetic files of identical structure but mixed content, each split across `--segments` segments (~500 MB total at defaults); times building a vertical lazy union (`scan_tdms` + `pl.concat` + `collect_schema`, no raw reads) without `.tdms_index` sidecars, then after generating them, and reports the speedup. `--path` holds the generated files (default `/tmp/opencode/bench_index`).
 
 ## Architecture & constraints worth knowing
 
