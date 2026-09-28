@@ -468,7 +468,18 @@ class TdmsSource:
             selected = [r for r in requests if r.name in wanted]
             if not selected:
                 return pl.DataFrame(schema=schema)
-            return _read_requested(handle, selected, chunk_size)
+            loaded = _read_requested(handle, selected, chunk_size)
+            selected_names = {r.name for r in selected}
+            return pl.DataFrame(
+                [
+                    loaded.get_column(r.name)
+                    if r.name in selected_names
+                    else pl.Series(r.name, [None], dtype=schema[r.name]).new_from_index(
+                        0, loaded.height
+                    )
+                    for r in requests
+                ]
+            )
 
         placeholder = pl.DataFrame(schema=schema)
         return placeholder.lazy().map_batches(
@@ -477,7 +488,7 @@ class TdmsSource:
             predicate_pushdown=False,
             projection_pushdown=True,
             slice_pushdown=False,
-            validate_output_schema=False,
+            validate_output_schema=True,
             streamable=False,
         )
 

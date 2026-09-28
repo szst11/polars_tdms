@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import tempfile
 
 import numpy as np
 import polars as pl
@@ -139,6 +140,24 @@ def test_projection_pushdown_only_loads_selected(tdms_file):
     assert channels_read == {"Current"}
 
 
+def test_projection_pushdown_drop_to_parquet_wide_schema(tmp_path):
+    path = tmp_path / "wide.tdms"
+    channels = [
+        ChannelObject("G", f"C{i}", ["text", "value"] if i == 2 else np.arange(2))
+        for i in range(45)
+    ]
+    with TdmsWriter(path) as writer:
+        writer.write_segment([GroupObject("G"), *channels])
+
+    parquet_path = tmp_path / "wide.parquet"
+    pt.scan_tdms(path, group="G").drop("C2").sink_parquet(parquet_path)
+
+    result = pl.read_parquet(parquet_path)
+    assert result.shape == (2, 44)
+    assert "C2" not in result.columns
+    assert result["C44"].to_list() == [0, 1]
+
+
 def test_chunked_matches_whole(tdms_file):
     whole = pt.read_tdms(tdms_file, group="Other")
     chunked = pt.read_tdms(tdms_file, group="Other", chunk_size=7)
@@ -149,19 +168,18 @@ def test_chunked_matches_whole(tdms_file):
 
 
 def test_empty_channel():
-    path = None
-    with TdmsWriter("/tmp/opencode/_empty_ch.tdms") as w:
-        w.write_segment(
-            [
-                GroupObject("G"),
-                ChannelObject("G", "Sig", np.array([], dtype=np.float64)),
-            ]
-        )
-        path = w._file
-    df = pt.read_tdms("/tmp/opencode/_empty_ch.tdms", group="G")
-    assert df.shape == (0, 1)
-    assert df.schema == {"Sig": pl.Float64}
-    _ = path
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = os.path.join(temp_dir, "empty_ch.tdms")
+        with TdmsWriter(path) as w:
+            w.write_segment(
+                [
+                    GroupObject("G"),
+                    ChannelObject("G", "Sig", np.array([], dtype=np.float64)),
+                ]
+            )
+        df = pt.read_tdms(path, group="G")
+        assert df.shape == (0, 1)
+        assert df.schema == {"Sig": pl.Float64}
 
 
 @pytest.fixture(scope="module")
@@ -193,77 +211,80 @@ def test_multi_segment(multiseg_file):
 
 
 def test_differing_lengths_raises():
-    path = "/tmp/opencode/_mismatch.tdms"
-    with TdmsWriter(path) as w:
-        w.write_segment(
-            [
-                GroupObject("G"),
-                ChannelObject("G", "A", np.arange(5.0)),
-                ChannelObject("G", "B", np.arange(3.0)),
-            ]
-        )
-    with pytest.raises(ValueError, match="differing sample counts"):
-        pt.read_tdms(path, group="G")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = os.path.join(temp_dir, "mismatch.tdms")
+        with TdmsWriter(path) as w:
+            w.write_segment(
+                [
+                    GroupObject("G"),
+                    ChannelObject("G", "A", np.arange(5.0)),
+                    ChannelObject("G", "B", np.arange(3.0)),
+                ]
+            )
+        with pytest.raises(ValueError, match="differing sample counts"):
+            pt.read_tdms(path, group="G")
 
 
 def test_string_channel_roundtrip():
-    path = "/tmp/opencode/_str_ch.tdms"
-    with TdmsWriter(path) as w:
-        ch = ChannelObject("G", "Label", ["a", "bb", "ccc"])
-        w.write_segment([GroupObject("G"), ch])
-    df = pt.read_tdms(path, group="G")
-    assert df.shape == (3, 1)
-    assert df.schema == {"Label": pl.Utf8}
-    assert df["Label"].to_list() == ["a", "bb", "ccc"]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = os.path.join(temp_dir, "str_ch.tdms")
+        with TdmsWriter(path) as w:
+            ch = ChannelObject("G", "Label", ["a", "bb", "ccc"])
+            w.write_segment([GroupObject("G"), ch])
+        df = pt.read_tdms(path, group="G")
+        assert df.shape == (3, 1)
+        assert df.schema == {"Label": pl.Utf8}
+        assert df["Label"].to_list() == ["a", "bb", "ccc"]
 
 
 def test_string_channel_buffers_path():
-    path = "/tmp/opencode/_str_buf.tdms"
-    with TdmsWriter(path) as w:
-        w.write_segment(
-            [GroupObject("G"), ChannelObject("G", "Label", ["ec", "", "a\U0001F600c"])]
-        )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = os.path.join(temp_dir, "str_buf.tdms")
+        with TdmsWriter(path) as w:
+            w.write_segment(
+                [GroupObject("G"), ChannelObject("G", "Label", ["ec", "", "a\U0001F600c"])]
+            )
 
-    src = pt.TdmsSource(path)
-    real = src._handle
+        src = pt.TdmsSource(path)
+        real = src._handle
 
-    class SpyHandle:
-        def __init__(self, h):
-            self._h = h
-            self.buffer_calls = 0
-            self.list_calls = 0
+        class SpyHandle:
+            def __init__(self, h):
+                self._h = h
+                self.buffer_calls = 0
+                self.list_calls = 0
 
-        def __getattr__(self, name):
-            return getattr(self._h, name)
+            def __getattr__(self, name):
+                return getattr(self._h, name)
 
-        def read_channel_strings_buffers(self, *a):
-            self.buffer_calls += 1
-            return self._h.read_channel_strings_buffers(*a)
+            def read_channel_strings_buffers(self, *a):
+                self.buffer_calls += 1
+                return self._h.read_channel_strings_buffers(*a)
 
-        def read_channel_strings(self, *a):
-            self.list_calls += 1
-            return self._h.read_channel_strings(*a)
+            def read_channel_strings(self, *a):
+                self.list_calls += 1
+                return self._h.read_channel_strings(*a)
 
-    src._handle = SpyHandle(real)
-    if pt._pa is not None:
-        df = src.read(group="G")
-        assert df["Label"].to_list() == ["ec", "", "a\U0001F600c"]
-        assert df.schema["Label"] == pl.Utf8
-        assert src._handle.buffer_calls > 0
+        src._handle = SpyHandle(real)
+        if pt._pa is not None:
+            df = src.read(group="G")
+            assert df["Label"].to_list() == ["ec", "", "a\U0001F600c"]
+            assert df.schema["Label"] == pl.Utf8
+            assert src._handle.buffer_calls > 0
 
-        offs, data = real.read_channel_strings_buffers("G", "Label", 0, 3)
-        n = len(offs) // 8 - 1
-        assert n == 3
-        import struct
+            offs, data = real.read_channel_strings_buffers("G", "Label", 0, 3)
+            n = len(offs) // 8 - 1
+            assert n == 3
+            import struct
 
-        parsed = []
-        for i in range(n):
-            s, e = struct.unpack_from("<qq", offs, i * 8)
-            parsed.append(data[s:e].decode("utf-8"))
-        assert parsed == ["ec", "", "a\U0001F600c"]
-    else:
-        df = src.read(group="G")
-        assert src._handle.list_calls > 0
+            parsed = []
+            for i in range(n):
+                s, e = struct.unpack_from("<qq", offs, i * 8)
+                parsed.append(data[s:e].decode("utf-8"))
+            assert parsed == ["ec", "", "a\U0001F600c"]
+        else:
+            df = src.read(group="G")
+            assert src._handle.list_calls > 0
 
 
 def test_mixed_group_with_string_channel(tmp_path):
@@ -291,21 +312,22 @@ def test_mixed_group_with_string_channel(tmp_path):
 
 
 def test_string_chunked_and_scan():
-    path = "/tmp/opencode/_str_scan.tdms"
-    strs = [f"s{i:04d}" for i in range(10)]
-    with TdmsWriter(path) as w:
-        w.write_segment([GroupObject("G"), ChannelObject("G", "Label", strs)])
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = os.path.join(temp_dir, "str_scan.tdms")
+        strs = [f"s{i:04d}" for i in range(10)]
+        with TdmsWriter(path) as w:
+            w.write_segment([GroupObject("G"), ChannelObject("G", "Label", strs)])
 
-    lf = pt.scan_tdms(path, group="G")
-    assert lf.collect_schema() == {"Label": pl.Utf8}
-    assert lf.filter(pl.col("Label").str.starts_with("s00")).collect()["Label"].to_list() == strs
+        lf = pt.scan_tdms(path, group="G")
+        assert lf.collect_schema() == {"Label": pl.Utf8}
+        assert lf.filter(pl.col("Label").str.starts_with("s00")).collect()["Label"].to_list() == strs
 
-    whole = pt.read_tdms(path, group="G")
-    chunked = pt.read_tdms(path, group="G", chunk_size=3)
-    single = pt.read_tdms(path, group="G", chunk_size=None)
-    assert whole.equals(chunked)
-    assert whole.equals(single)
-    assert chunked["Label"].to_list() == strs
+        whole = pt.read_tdms(path, group="G")
+        chunked = pt.read_tdms(path, group="G", chunk_size=3)
+        single = pt.read_tdms(path, group="G", chunk_size=None)
+        assert whole.equals(chunked)
+        assert whole.equals(single)
+        assert chunked["Label"].to_list() == strs
 
 
 def test_numeric_buffer_path(tmp_path):
