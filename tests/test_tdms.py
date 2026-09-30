@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import gc
 import os
 import tempfile
 
@@ -83,6 +84,49 @@ def test_read_tdms_values(tdms_file):
     assert df["On"].to_list() == [True, False] * 10
 
 
+def test_copy_to_temp_includes_index_and_cleans_up(tdms_file):
+    with pt.open_tdms(tdms_file):
+        pass
+    assert os.path.isfile(f"{tdms_file}_index")
+
+    source = pt.TdmsSource(tdms_file, copy_to_temp=True)
+    local_path = source._access_path
+    local_directory = os.path.dirname(local_path)
+    assert source.path == os.fspath(tdms_file)
+    assert local_path != source.path
+    assert os.path.isfile(local_path)
+    assert os.path.isfile(f"{local_path}_index")
+    assert source.read(group="Sensors", columns=["Current"])["Current"].to_list() == list(
+        range(100, 120)
+    )
+    assert pt.read_tdms(
+        tdms_file, group="Sensors", columns=["Current"], copy_to_temp=True
+    )["Current"].to_list() == list(range(100, 120))
+
+    source.close()
+    assert not os.path.exists(local_directory)
+
+
+def test_copy_to_temp_lives_as_long_as_lazy_scan(tdms_file):
+    source = pt.TdmsSource(tdms_file, copy_to_temp=True)
+    local_path = source._access_path
+    local_directory = os.path.dirname(local_path)
+    lazy_frame = source.scan(group="Sensors", columns=["Current"])
+
+    source.close()
+    assert os.path.isfile(local_path)
+    assert lazy_frame.collect()["Current"].to_list() == list(range(100, 120))
+
+    del lazy_frame
+    gc.collect()
+    assert not os.path.exists(local_directory)
+
+    lazy_frame = pt.scan_tdms(
+        tdms_file, group="Sensors", columns=["Current"], copy_to_temp=True
+    )
+    assert lazy_frame.collect()["Current"].to_list() == list(range(100, 120))
+
+
 def test_matches_nptdms(tdms_file):
     ours = pt.read_tdms(tdms_file, group="Other")
     ref = TdmsFile.read(tdms_file)
@@ -156,6 +200,29 @@ def test_projection_pushdown_drop_to_parquet_wide_schema(tmp_path):
     assert result.shape == (2, 44)
     assert "C2" not in result.columns
     assert result["C44"].to_list() == [0, 1]
+
+
+def test_fragmented_string_and_numeric_reads(tmp_path):
+    path = tmp_path / "fragmented.tdms"
+    expected_numeric = []
+    expected_labels = []
+    with TdmsWriter(path) as writer:
+        for segment in range(12):
+            values = np.arange(segment * 5, (segment + 1) * 5, dtype=np.int32)
+            labels = [f"segment-{segment}-value-{i}" for i in range(5)]
+            writer.write_segment(
+                [
+                    GroupObject("G"),
+                    ChannelObject("G", "Numeric", values),
+                    ChannelObject("G", "Label", labels),
+                ]
+            )
+            expected_numeric.extend(values.tolist())
+            expected_labels.extend(labels)
+
+    result = pt.read_tdms(path, group="G")
+    assert result["Numeric"].to_list() == expected_numeric
+    assert result["Label"].to_list() == expected_labels
 
 
 def test_chunked_matches_whole(tdms_file):
