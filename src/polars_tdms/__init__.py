@@ -23,29 +23,26 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Self
 
 import polars as pl
+import pyarrow as _pa
 
 from . import _core
-
-try:
-    import pyarrow as _pa
-except ImportError:  # pragma: no cover - optional fast path
-    _pa = None
 
 __version__ = _core.__version__
 
 __all__ = [
-    "Channel",
     "DEFAULT_CHUNK_SIZE",
+    "Channel",
     "Group",
     "TdmsMetadata",
     "TdmsSource",
     "open_tdms",
-    "read_tdms",
     "read_metadata",
+    "read_tdms",
     "scan_tdms",
 ]
 
@@ -53,10 +50,10 @@ __all__ = [
 DEFAULT_CHUNK_SIZE = 1_000_000
 
 # TDMS "zero" time: the LabVIEW epoch used for timestamps.
-_TDMS_EPOCH = _dt.datetime(1904, 1, 1)
+_TDMS_EPOCH = _dt.datetime(1904, 1, 1, tzinfo=_dt.UTC)
 
 #: TDMS DataType name (as reported by tdms-rs) -> polars dtype.
-DTYPE_TO_POLARS: dict[str, pl.DataType] = {
+DTYPE_TO_POLARS: dict[str, type[pl.DataType] | pl.DataType] = {
     "I8": pl.Int8,
     "I16": pl.Int16,
     "I32": pl.Int32,
@@ -95,7 +92,11 @@ _READABLE_DTYPES = frozenset(
 
 def _convert_property(value: Any) -> Any:
     """Convert raw values returned by the Rust core into Python objects."""
-    if isinstance(value, tuple) and len(value) == 2 and all(isinstance(x, int) for x in value):
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(isinstance(x, int) for x in value)
+    ):
         seconds, fraction = value
         return _TDMS_EPOCH + _dt.timedelta(seconds=seconds + fraction / (1 << 64))
     return value
@@ -115,7 +116,7 @@ class Channel:
     properties: Mapping[str, Any]
 
     @property
-    def polars_dtype(self) -> pl.DataType:
+    def polars_dtype(self) -> type[pl.DataType] | pl.DataType:
         return DTYPE_TO_POLARS[self.dtype]
 
     @property
@@ -246,7 +247,9 @@ def _series_from_numpy(name: str, arr: Any) -> pl.Series:
     return pl.Series(name, arr, strict=False)
 
 
-def _series_from_string_buffers(name: str, offsets: bytes, data: bytes, n: int) -> pl.Series:
+def _series_from_string_buffers(
+    name: str, offsets: bytes, data: bytes, n: int
+) -> pl.Series:
     arr = _pa.Array.from_buffers(
         _pa.large_string(),
         n,
@@ -271,7 +274,9 @@ def _arrow_dtype(name: str) -> Any:
     }[name]
 
 
-def _series_from_numeric_buffers(name: str, dtype: str, data: bytes, n: int) -> pl.Series:
+def _series_from_numeric_buffers(
+    name: str, dtype: str, data: bytes, n: int
+) -> pl.Series:
     arr = _pa.Array.from_buffers(_arrow_dtype(dtype), n, [None, _pa.py_buffer(data)])
     return pl.Series(name, arr)
 
@@ -287,7 +292,9 @@ def _read_numeric_channel_series(
     for start in range(0, req.length, chunk_size):
         end = min(start + chunk_size, req.length)
         data = handle.read_channel_range_buffers(req.group, req.channel, start, end)
-        pieces.append(_series_from_numeric_buffers(req.name, req.dtype, data, end - start))
+        pieces.append(
+            _series_from_numeric_buffers(req.name, req.dtype, data, end - start)
+        )
     if len(pieces) == 1:
         return pieces[0]
     return pl.concat(pieces, rechunk=False)
@@ -457,7 +464,7 @@ class TdmsSource:
             raise RuntimeError("TdmsSource has been closed")
         handle = self._handle
         requests = _resolve_channels(meta, group, columns)
-        schema: dict[str, pl.DataType] = {
+        schema: dict[str, type[pl.DataType] | pl.DataType] = {
             r.name: DTYPE_TO_POLARS[r.dtype] for r in requests
         }
         if not schema:
@@ -501,10 +508,10 @@ class TdmsSource:
         """Eagerly build a :class:`pl.DataFrame` for the requested group/channels."""
         return self.scan(group=group, columns=columns, chunk_size=chunk_size).collect()
 
-    def __enter__(self) -> "TdmsSource":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *_exc: Any) -> None:
+    def __exit__(self, *_exc: object) -> None:
         self.close()
 
 
