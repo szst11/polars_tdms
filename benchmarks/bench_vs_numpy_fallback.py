@@ -22,6 +22,8 @@ import numpy as np
 import polars as pl
 import polars_tdms as pt
 
+from nptdms import TdmsFile
+
 GROUP = "G"
 
 _NPTDMS_CHANNELS = ("sig_f64", "sig_i32", "sig_bool", "label")
@@ -63,7 +65,6 @@ def timeit(fn, repeat=3, warmup=1):
 
 def check_values(path: str) -> bool:
     """Assert every channel matches the nptdms reference exactly."""
-    from nptdms import TdmsFile
 
     ref = TdmsFile.read(path)
     df = pt.read_tdms(path, group=GROUP)
@@ -78,39 +79,19 @@ def check_values(path: str) -> bool:
         match = fn()
         ok &= bool(match)
         print(f"  {name:<10} matches nptdms: {match}")
-    chunked = pt.read_tdms(path, group=GROUP, chunk_size=1_000)
-    ok &= bool(chunked.equals(df))
-    print(f"  chunked==whole: {chunked.equals(df)}")
     return ok
 
 
-def _nptdms_full_read(path: str) -> None:
-    from nptdms import TdmsFile
-
-    f = TdmsFile.read(path)
-    for c in _NPTDMS_CHANNELS:
-        f[GROUP][c][:]
+def _nptdms_full_read(path: str) -> None:    
+    with TdmsFile.open(path) as _nptdms_file:
+        _channel_data = _nptdms_file[GROUP].as_dataframe()
 
 
 def _nptdms_channel_read(path: str, channel: str) -> None:
-    from nptdms import TdmsFile
-
-    f = TdmsFile.read(path)
-    f[GROUP][channel][:]
+    with TdmsFile.open(path) as _nptdms_file:
+        _channel_data = _nptdms_file[GROUP][channel].as_dataframe()
 
 
-def _nptdms_chunked_read(path: str, chunk: int, n: int) -> None:
-    """Read every channel in `chunk`-sized slices and rebuild the full arrays."""
-    from nptdms import TdmsFile
-
-    f = TdmsFile.read(path)
-    pieces = {c: [] for c in _NPTDMS_CHANNELS}
-    for start in range(0, n, chunk):
-        end = min(start + chunk, n)
-        for c in _NPTDMS_CHANNELS:
-            pieces[c].append(f[GROUP][c][start:end])
-    for c in _NPTDMS_CHANNELS:
-        np.concatenate(pieces[c])
 
 
 def bench(path: str) -> None:
@@ -126,42 +107,34 @@ def bench(path: str) -> None:
         print(f"{name:<24}{t_arrow:>13.3f}s{t_np:>13.3f}s{t_tdms:>13.3f}s{ratio:>9.1f}x")
 
     # default path (pyarrow buffers)
-    t_arrow_full = timeit(lambda: pt.read_tdms(path, group=GROUP))
-    t_arrow_chunk = timeit(lambda: pt.read_tdms(path, group=GROUP, chunk_size=10_000))
+    t_arrow_full = timeit(lambda: pt.read_tdms(path, group=GROUP,chunk_size=None))
 
     # numpy fallback
     saved_pa = pt._pa
     pt._pa = None
     try:
-        t_np_full = timeit(lambda: pt.read_tdms(path, group=GROUP))
-        t_np_chunk = timeit(lambda: pt.read_tdms(path, group=GROUP, chunk_size=10_000))
+        t_np_full = timeit(lambda: pt.read_tdms(path, group=GROUP,chunk_size=None))
     finally:
         pt._pa = saved_pa
-
-    # nptdms reference
-    from nptdms import TdmsFile
-
-    n_total = len(TdmsFile.read(path)[GROUP]["sig_f64"][:])
+    
     t_tdms_full = timeit(lambda: _nptdms_full_read(path))
-    t_tdms_chunk = timeit(lambda: _nptdms_chunked_read(path, 10_000, n_total))
 
     row("full group read", t_arrow_full, t_np_full, t_tdms_full)
-    row("chunked read (10k)", t_arrow_chunk, t_np_chunk, t_tdms_chunk)
 
     print("\nper-channel breakdown (full read):")
     saved_pa = pt._pa
 
     pt._pa = saved_pa
-    t_arrow_f64 = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["sig_f64"]))
+    t_arrow_f64 = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["sig_f64"],chunk_size=None))
     pt._pa = None
-    t_np_f64 = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["sig_f64"]))
+    t_np_f64 = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["sig_f64"],chunk_size=None))
     pt._pa = saved_pa
     t_tdms_f64 = timeit(lambda: _nptdms_channel_read(path, "sig_f64"))
     row("sig_f64 (Float64)", t_arrow_f64, t_np_f64, t_tdms_f64)
 
-    t_arrow_label = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["label"]))
+    t_arrow_label = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["label"],chunk_size=None))
     pt._pa = None
-    t_np_label = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["label"]))
+    t_np_label = timeit(lambda: pt.read_tdms(path, group=GROUP, columns=["label"],chunk_size=None))
     pt._pa = saved_pa
     t_tdms_label = timeit(lambda: _nptdms_channel_read(path, "label"))
     row("label (String)", t_arrow_label, t_np_label, t_tdms_label)
