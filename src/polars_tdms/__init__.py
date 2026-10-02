@@ -56,6 +56,7 @@ _TDMS_EPOCH = _dt.datetime(1904, 1, 1, tzinfo=_dt.UTC)
 
 #: TDMS DataType name (as reported by tdms-rs) -> polars dtype.
 DTYPE_TO_POLARS: dict[str, type[pl.DataType] | pl.DataType] = {
+    "Void": pl.Null,
     "I8": pl.Int8,
     "I16": pl.Int16,
     "I32": pl.Int32,
@@ -72,8 +73,8 @@ DTYPE_TO_POLARS: dict[str, type[pl.DataType] | pl.DataType] = {
 }
 
 #: Channel data types whose samples can be loaded into columns (all POD types
-#: plus String). TimeStamp is exposed in the metadata but tdms-rs 2.x can't
-#: decode its raw data, so those channels are skipped when building frames.
+#: plus String). TimeStamp and Void remain metadata-only and are skipped when
+#: building frames.
 _READABLE_DTYPES = frozenset(
     {
         "I8",

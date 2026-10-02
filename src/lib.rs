@@ -25,6 +25,7 @@ fn channel_by_name<'a>(
 
 fn dtype_name(dt: &DataType) -> &'static str {
     match dt {
+        DataType::Void => "Void",
         DataType::I8 => "I8",
         DataType::I16 => "I16",
         DataType::I32 => "I32",
@@ -98,6 +99,11 @@ fn read_channel_into_numpy(
         }};
     }
     Ok(match channel.dtype() {
+        DataType::Void => {
+            return Err(PyNotImplementedError::new_err(
+                "Void channels do not contain readable sample data",
+            ))
+        }
         DataType::I8 => read_typed!(i8),
         DataType::I16 => read_typed!(i16),
         DataType::I32 => read_typed!(i32),
@@ -153,6 +159,11 @@ fn read_channel_into_bytes(
         }};
     }
     Ok(match channel.dtype() {
+        DataType::Void => {
+            return Err(PyNotImplementedError::new_err(
+                "Void channels do not contain readable sample data",
+            ))
+        }
         DataType::I8 => read_typed!(i8),
         DataType::I16 => read_typed!(i16),
         DataType::I32 => read_typed!(i32),
