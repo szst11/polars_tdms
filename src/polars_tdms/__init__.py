@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Self
 
 import polars as pl
-import pyarrow as _pa
+import pyarrow as pa
 
 from . import _core
 
@@ -246,38 +246,33 @@ def _resolve_channels(
     return requests
 
 
-
-def _series_from_string_buffers(
-    name: str, offsets: bytes, data: bytes, n: int
-) -> pl.Series:
-    arr = _pa.Array.from_buffers(
-        _pa.large_string(),
+def _series_from_string_buffers(name: str, offsets: bytes, data: bytes, n: int) -> pl.Series:
+    arr = pa.Array.from_buffers(
+        pa.large_string(),
         n,
-        [None, _pa.py_buffer(offsets), _pa.py_buffer(data)],
+        [None, pa.py_buffer(offsets), pa.py_buffer(data)],
     )
     return pl.Series(name, arr)
 
 
 def _arrow_dtype(name: str) -> Any:
     return {
-        "I8": _pa.int8(),
-        "I16": _pa.int16(),
-        "I32": _pa.int32(),
-        "I64": _pa.int64(),
-        "U8": _pa.uint8(),
-        "U16": _pa.uint16(),
-        "U32": _pa.uint32(),
-        "U64": _pa.uint64(),
-        "Float": _pa.float32(),
-        "Double": _pa.float64(),
-        "Boolean": _pa.bool_(),
+        "I8": pa.int8(),
+        "I16": pa.int16(),
+        "I32": pa.int32(),
+        "I64": pa.int64(),
+        "U8": pa.uint8(),
+        "U16": pa.uint16(),
+        "U32": pa.uint32(),
+        "U64": pa.uint64(),
+        "Float": pa.float32(),
+        "Double": pa.float64(),
+        "Boolean": pa.bool_(),
     }[name]
 
 
-def _series_from_numeric_buffers(
-    name: str, dtype: str, data: bytes, n: int
-) -> pl.Series:
-    arr = _pa.Array.from_buffers(_arrow_dtype(dtype), n, [None, _pa.py_buffer(data)])
+def _series_from_numeric_buffers(name: str, dtype: str, data: bytes, n: int) -> pl.Series:
+    arr = pa.Array.from_buffers(_arrow_dtype(dtype), n, [None, pa.py_buffer(data)])
     return pl.Series(name, arr)
 
 
@@ -300,7 +295,6 @@ def _read_numeric_channel_series(
     return pl.concat(pieces, rechunk=False)
 
 
-
 def _read_string_channel_series(
     handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
 ) -> pl.Series:
@@ -317,22 +311,6 @@ def _read_string_channel_series(
             req.group, req.channel, start, end
         )
         pieces.append(_series_from_string_buffers(req.name, offsets, data, end - start))
-    if len(pieces) == 1:
-        return pieces[0]
-    return pl.concat(pieces, rechunk=False)
-
-
-def _read_string_channel_series_list(
-    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
-) -> pl.Series:
-    if chunk_size is None or chunk_size <= 0 or chunk_size >= req.length:
-        vals = handle.read_channel_strings(req.group, req.channel, 0, req.length)
-        return pl.Series(req.name, vals, dtype=pl.Utf8)
-    pieces: list[pl.Series] = []
-    for start in range(0, req.length, chunk_size):
-        end = min(start + chunk_size, req.length)
-        vals = handle.read_channel_strings(req.group, req.channel, start, end)
-        pieces.append(pl.Series(req.name, vals, dtype=pl.Utf8))
     if len(pieces) == 1:
         return pieces[0]
     return pl.concat(pieces, rechunk=False)
