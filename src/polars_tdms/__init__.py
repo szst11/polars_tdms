@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import shutil
+import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Self
 
 import polars as pl
 import pyarrow as pa
@@ -34,14 +37,14 @@ from . import _core
 __version__ = _core.__version__
 
 __all__ = [
-    "Channel",
     "DEFAULT_CHUNK_SIZE",
+    "Channel",
     "Group",
     "TdmsMetadata",
     "TdmsSource",
     "open_tdms",
-    "read_tdms",
     "read_metadata",
+    "read_tdms",
     "scan_tdms",
 ]
 
@@ -49,10 +52,11 @@ __all__ = [
 DEFAULT_CHUNK_SIZE = 1_000_000
 
 # TDMS "zero" time: the LabVIEW epoch used for timestamps.
-_TDMS_EPOCH = _dt.datetime(1904, 1, 1)
+_TDMS_EPOCH = _dt.datetime(1904, 1, 1, tzinfo=_dt.UTC)
 
 #: TDMS DataType name (as reported by tdms-rs) -> polars dtype.
-DTYPE_TO_POLARS: dict[str, pl.DataType] = {
+DTYPE_TO_POLARS: dict[str, type[pl.DataType] | pl.DataType] = {
+    "Void": pl.Null,
     "I8": pl.Int8,
     "I16": pl.Int16,
     "I32": pl.Int32,
@@ -69,8 +73,8 @@ DTYPE_TO_POLARS: dict[str, pl.DataType] = {
 }
 
 #: Channel data types whose samples can be loaded into columns (all POD types
-#: plus String). TimeStamp is exposed in the metadata but tdms-rs 2.x can't
-#: decode its raw data, so those channels are skipped when building frames.
+#: plus String). TimeStamp and Void remain metadata-only and are skipped when
+#: building frames.
 _READABLE_DTYPES = frozenset(
     {
         "I8",
@@ -91,7 +95,11 @@ _READABLE_DTYPES = frozenset(
 
 def _convert_property(value: Any) -> Any:
     """Convert raw values returned by the Rust core into Python objects."""
-    if isinstance(value, tuple) and len(value) == 2 and all(isinstance(x, int) for x in value):
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(isinstance(x, int) for x in value)
+    ):
         seconds, fraction = value
         return _TDMS_EPOCH + _dt.timedelta(seconds=seconds + fraction / (1 << 64))
     return value
@@ -111,7 +119,7 @@ class Channel:
     properties: Mapping[str, Any]
 
     @property
-    def polars_dtype(self) -> pl.DataType:
+    def polars_dtype(self) -> type[pl.DataType] | pl.DataType:
         return DTYPE_TO_POLARS[self.dtype]
 
     @property
@@ -279,7 +287,9 @@ def _read_numeric_channel_series(
     for start in range(0, req.length, chunk_size):
         end = min(start + chunk_size, req.length)
         data = handle.read_channel_range_buffers(req.group, req.channel, start, end)
-        pieces.append(_series_from_numeric_buffers(req.name, req.dtype, data, end - start))
+        pieces.append(
+            _series_from_numeric_buffers(req.name, req.dtype, data, end - start)
+        )
     if len(pieces) == 1:
         return pieces[0]
     return pl.concat(pieces, rechunk=False)
@@ -341,11 +351,48 @@ class TdmsSource:
     Opening only parses the metadata (the same work as :func:`read_metadata`);
     raw samples are read on demand. Use it as a context manager, or drop it to
     release the underlying file handle.
+
+    The metadata index can come from a sibling ``<file>.tdms_index`` companion
+    file (see the ``use_index_file`` / ``create_index_if_missing`` /
+    ``verify_index`` parameters). Set ``copy_to_temp=True`` to read a temporary
+    local copy of the TDMS and any existing companion index.
     """
 
-    def __init__(self, path: str | os.PathLike[str]):
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        use_index_file: bool = True,
+        create_index_if_missing: bool = True,
+        verify_index: bool = False,
+        copy_to_temp: bool = False,
+    ):
         self._path = os.fspath(path)
-        self._handle: _core.TdmsHandle | None = _core.TdmsHandle(self._path)
+        self._temporary_directory = None
+        self._access_path = self._path
+        if copy_to_temp:
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix="polars_tdms_"
+            )
+            try:
+                filename = os.path.basename(self._path)
+                self._access_path = os.path.join(
+                    self._temporary_directory.name, filename
+                )
+                shutil.copy2(self._path, self._access_path)
+                source_index = f"{self._path}_index"
+                if os.path.isfile(source_index):
+                    shutil.copy2(source_index, f"{self._access_path}_index")
+            except Exception:
+                self._temporary_directory.cleanup()
+                self._temporary_directory = None
+                raise
+        self._handle: _core.TdmsHandle | None = _core.TdmsHandle(
+            self._access_path,
+            use_index_file=use_index_file,
+            create_index_if_missing=create_index_if_missing,
+            verify_index=verify_index,
+        )
         self._metadata: TdmsMetadata | None = None
 
     @property
@@ -365,6 +412,7 @@ class TdmsSource:
 
     def close(self) -> None:
         self._handle = None
+        self._temporary_directory = None
 
     def scan(
         self,
@@ -394,19 +442,32 @@ class TdmsSource:
         if self._handle is None:
             raise RuntimeError("TdmsSource has been closed")
         handle = self._handle
+        temporary_directory = self._temporary_directory
         requests = _resolve_channels(meta, group, columns)
-        schema: dict[str, pl.DataType] = {
+        schema: dict[str, type[pl.DataType] | pl.DataType] = {
             r.name: DTYPE_TO_POLARS[r.dtype] for r in requests
         }
         if not schema:
             raise ValueError(f"no readable channel data in {self._path!r}")
 
         def _load_batch(_in: pl.DataFrame) -> pl.DataFrame:
+            _ = temporary_directory
             wanted = set(_in.columns)
             selected = [r for r in requests if r.name in wanted]
             if not selected:
                 return pl.DataFrame(schema=schema)
-            return _read_requested(handle, selected, chunk_size)
+            loaded = _read_requested(handle, selected, chunk_size)
+            selected_names = {r.name for r in selected}
+            return pl.DataFrame(
+                [
+                    loaded.get_column(r.name)
+                    if r.name in selected_names
+                    else pl.Series(r.name, [None], dtype=schema[r.name]).new_from_index(
+                        0, loaded.height
+                    )
+                    for r in requests
+                ]
+            )
 
         placeholder = pl.DataFrame(schema=schema)
         return placeholder.lazy().map_batches(
@@ -415,7 +476,7 @@ class TdmsSource:
             predicate_pushdown=False,
             projection_pushdown=True,
             slice_pushdown=False,
-            validate_output_schema=False,
+            validate_output_schema=True,
             streamable=False,
         )
 
@@ -428,21 +489,61 @@ class TdmsSource:
         """Eagerly build a :class:`pl.DataFrame` for the requested group/channels."""
         return self.scan(group=group, columns=columns, chunk_size=chunk_size).collect()
 
-    def __enter__(self) -> "TdmsSource":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *_exc: Any) -> None:
+    def __exit__(self, *_exc: object) -> None:
         self.close()
 
 
-def open_tdms(path: str | os.PathLike[str]) -> TdmsSource:
-    """Open a TDMS file, indexing its metadata immediately."""
-    return TdmsSource(path)
+def open_tdms(
+    path: str | os.PathLike[str],
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
+    copy_to_temp: bool = False,
+) -> TdmsSource:
+    """Open a TDMS file, indexing its metadata immediately.
+
+    When a sibling ``<file>.tdms_index`` companion file exists (and
+    ``use_index_file`` is true) it is used for the metadata index, so opening
+    never scans the raw data. A missing, empty, stale, or corrupt index is
+    skipped in favor of the data file and (when ``create_index_if_missing``)
+    regenerated best-effort. ``verify_index`` re-parses both files and raises
+    ``ValueError`` on mismatch. ``copy_to_temp`` copies the TDMS and any
+    existing companion index into a temporary directory for local reads; the
+    directory is removed when the source and its lazy scans are released.
+    """
+    return TdmsSource(
+        path,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+        copy_to_temp=copy_to_temp,
+    )
 
 
-def read_metadata(path: str | os.PathLike[str]) -> TdmsMetadata:
-    """Read the full TDMS metadata without loading any raw channel data."""
-    with TdmsSource(path) as src:
+def read_metadata(
+    path: str | os.PathLike[str],
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
+    copy_to_temp: bool = False,
+) -> TdmsMetadata:
+    """Read the full TDMS metadata without loading any raw channel data.
+
+    See :func:`open_tdms` for the ``use_index_file`` / ``create_index_if_missing``
+    / ``verify_index`` / ``copy_to_temp`` options.
+    """
+    with TdmsSource(
+        path,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+        copy_to_temp=copy_to_temp,
+    ) as src:
         return src.metadata
 
 
@@ -451,13 +552,26 @@ def scan_tdms(
     group: str | Sequence[str] | None = None,
     columns: Sequence[str] | None = None,
     chunk_size: int | None = DEFAULT_CHUNK_SIZE,
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
+    copy_to_temp: bool = False,
 ) -> pl.LazyFrame:
     """Lazily scan a TDMS file as a ``pl.LazyFrame``.
 
     Only metadata is parsed up front; channel data is read when the frame is
-    collected (see :meth:`TdmsSource.scan` for the parameters).
+    collected (see :meth:`TdmsSource.scan` for the parameters). See
+    :func:`open_tdms` for the ``use_index_file`` / ``create_index_if_missing``
+    / ``verify_index`` options.
     """
-    return TdmsSource(path).scan(group=group, columns=columns, chunk_size=chunk_size)
+    return TdmsSource(
+        path,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+        copy_to_temp=copy_to_temp,
+    ).scan(group=group, columns=columns, chunk_size=chunk_size)
 
 
 def read_tdms(
@@ -465,6 +579,24 @@ def read_tdms(
     group: str | Sequence[str] | None = None,
     columns: Sequence[str] | None = None,
     chunk_size: int | None = DEFAULT_CHUNK_SIZE,
+    *,
+    use_index_file: bool = True,
+    create_index_if_missing: bool = True,
+    verify_index: bool = False,
+    copy_to_temp: bool = False,
 ) -> pl.DataFrame:
-    """Eagerly read a TDMS group into a ``pl.DataFrame``."""
-    return scan_tdms(path, group=group, columns=columns, chunk_size=chunk_size).collect()
+    """Eagerly read a TDMS group into a ``pl.DataFrame``.
+
+    See :func:`open_tdms` for the ``use_index_file`` / ``create_index_if_missing``
+    / ``verify_index`` / ``copy_to_temp`` options.
+    """
+    return scan_tdms(
+        path,
+        group=group,
+        columns=columns,
+        chunk_size=chunk_size,
+        use_index_file=use_index_file,
+        create_index_if_missing=create_index_if_missing,
+        verify_index=verify_index,
+        copy_to_temp=copy_to_temp,
+    ).collect()

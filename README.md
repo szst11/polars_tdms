@@ -56,6 +56,16 @@ skipped when building frames.
 
 `group=None` merges all groups (channels prefixed with `GroupName/`).
 
+### `.tdms_index` companion files
+
+Every entry point also accepts `use_index_file=True`, `create_index_if_missing=True`
+and `verify_index=False` (matching `tdms-rs` `OpenOptions`). When a sibling
+`<file>.tdms_index` exists it is used to build the metadata index quickly, so
+opening a large file scans the small index instead of the raw data. A missing,
+empty, stale, or corrupt index falls back to the data file and — unless
+`create_index_if_missing=False` — is regenerated best-effort. `verify_index=True`
+re-parses both files and raises `ValueError` on a mismatch.
+
 ## Benchmarks
 
 All scripts live in `benchmarks/`. The two synthetic scripts accept
@@ -66,6 +76,7 @@ All scripts live in `benchmarks/`. The two synthetic scripts accept
 | `bench_vs_nptdms.py` | synthetic f64 file | metadata, full/partial reads and peak RSS vs nptdms |
 | `bench_vs_nptdms_mixed.py` | synthetic mixed-type file (Float64/Int32/Boolean/String, many segments) | pyarrow read path vs nptdms, full group and per-channel |
 | `bench_file_vs_nptdms.py` | an existing file + group (positional args) | pyarrow path vs nptdms, full/chunked/per-channel |
+| `bench_tdms_index.py` | N synthetic files of identical structure, mixed content, many segments (~500 MB total) | vertical lazy-union build (scan + schema, no raw reads) with vs without `.tdms_index` |
 
 ```bash
 uv run --extra bench python benchmarks/bench_vs_nptdms.py \
@@ -75,6 +86,9 @@ uv run --all-extras python benchmarks/bench_vs_nptdms_mixed.py \
     --segments=200 --samples-per-segment=100000
 
 uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ
+
+uv run --all-extras python benchmarks/bench_tdms_index.py \
+    --n-files=100 --samples=200000 --segments=200
 ```
 
 Each script first verifies polars_tdms values against nptdms and only reports

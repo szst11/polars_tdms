@@ -1,34 +1,38 @@
-"""Benchmark polars_tdms (Rust/tdms-rs backend) against nptdms.
+"""Benchmark the polars_tdms pyarrow read path against nptdms on an existing file.
 
-Generates a synthetic multi-channel TDMS file, then times metadata parsing
-and full / partial channel reads, measuring wall time and peak RSS.
+Takes a TDMS file path and a group name, verifies that polars_tdms returns the
+same values as the nptdms reference for every readable channel, then times the
+default pyarrow/"buffers" implementation against nptdms for full group reads
+and per-channel reads. Channels whose samples are metadata-only (TimeStamp)
+are skipped, matching polars_tdms behaviour.
 
 Usage:
-    uv run --extra bench python benchmarks/bench_vs_nptdms.py --samples=2000000 --channels=8
+    uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ    
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
-import resource
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
-import polars as pl
 import polars_tdms as pt
+from nptdms import TdmsFile
 
-GROUP = "DAQ"
+class _Req(NamedTuple):
+    name: str
+    channel: str
+    dtype: str
+    length: int
 
 
-def max_rss_kb() -> int:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-
-
-def timeit(fn, repeat=3):
+def timeit(fn, repeat=3, warmup=1):
+    for _ in range(warmup):
+        fn()
     best = float("inf")
     for _ in range(repeat):
         t0 = time.perf_counter()
@@ -37,133 +41,150 @@ def timeit(fn, repeat=3):
     return best
 
 
-_RUNNER = str(Path(__file__).resolve().parent / "_rss_runner.py")
+def _nptdms_read_group(path: str, group: str) -> None:    
+    with TdmsFile.open(path) as _nptdms_file:
+            selected_group_pandas_df = _nptdms_file[group].as_dataframe()
 
 
-def peak_rss_mib(op: str, path: str, group: str, cols) -> int:
-    """Peak RSS of the op in a fresh subprocess (VmRSS, KiB -> MiB)."""
-    import subprocess
-
-    out = subprocess.run(
-        [sys.executable, _RUNNER, op, path, group, ",".join(cols)],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        raise RuntimeError(f"{op} failed:\n{out.stderr}")
-    return int(out.stdout.strip()) / 1024  # KiB -> MiB
+def _nptdms_read_channel(path: str, group: str, channel: str) -> None:
+    #_nptdms_read_group(path, group, [channel])
+    with TdmsFile.open(path) as _nptdms_file:
+            _channel_data = _nptdms_file[group][channel].as_dataframe()
 
 
-def make_file(path: str, samples: int, channels: int) -> None:
-    """Write a synthetic TDMS file with nptdms (single segment, f64 channels)."""
-    from nptdms import TdmsWriter, GroupObject, ChannelObject
+def _nptdms_read_group_chunked(
+    path: str, group: str, channels: list[str], chunk: int, n: int
+) -> None:
+    """Read every channel in `chunk`-sized slices and rebuild the full arrays."""
 
-    rng = np.random.default_rng(0)
-    with TdmsWriter(path) as w:
-        grp = GroupObject(GROUP, properties={"sampling_rate": float(50_000)})
-        seg = [grp]
-        for i in range(channels):
-            data = np.sin(np.arange(samples) / 1000.0 + i) + 0.001 * rng.standard_normal(samples)
-            seg.append(ChannelObject(GROUP, f"Ch{i}", data))
-        w.write_segment(seg)
+    if n <= 0:
+        return
+    f = TdmsFile.read(path)
+    pieces = {c: [] for c in channels}
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        for c in channels:
+            pieces[c].append(f[group][c][start:end])
+    for c in channels:
+        np.concatenate(pieces[c])
 
 
-def bench(path: str, group: str, channels: int) -> None:
-    header = f"{'benchmark':<52}{'nptdms':>14}{'polars_tdms':>14}{'ratio':>10}"
+def check_values(path: str, group: str, requests: list[_Req]) -> bool:
+    """Assert every readable channel matches the nptdms reference exactly."""
+
+    df = pt.read_tdms(path, group=group)
+    f = TdmsFile.read(path)
+    ok = True
+    for r in requests:
+        ref = f[group][r.channel][:]
+        if r.dtype == "String":
+            match = df[r.name].to_list() == ref.tolist()
+        elif r.dtype in ("Float", "Double"):
+            match = bool(np.allclose(df[r.name].to_numpy(), ref, equal_nan=True))
+        else:
+            match = bool(np.array_equal(df[r.name].to_numpy(), ref))
+        ok &= match
+        print(f"  {r.name:<24} matches nptdms: {match}")
+
+    if len({r.length for r in requests}) == 1:
+        chunked = pt.read_tdms(path, group=group, chunk_size=10_000)
+        ok &= bool(chunked.equals(df))
+        print(f"  chunked==whole: {chunked.equals(df)}")
+    else:
+        print("  chunked==whole: skipped (channels differ in length)")
+    return ok
+
+
+def bench(
+    path: str,
+    group: str,
+    requests: list[_Req],    
+    repeat: int,
+    warmup: int,
+) -> None:
+    equal_length = len({r.length for r in requests}) == 1
+
+    header = f"{'benchmark':<30}{'polars_tdms':>16}{'nptdms':>16}{'speedup':>10}"
     print(header)
     print("-" * len(header))
 
-    def row(name, nptdms_t, ours_t, unit="s"):
-        ratio = nptdms_t / ours_t if ours_t else float("nan")
-        if unit == "ms":
-            n, o = f"{nptdms_t * 1000:>11.2f}ms", f"{ours_t * 1000:>11.2f}ms"
-        else:
-            n, o = f"{nptdms_t:>12.3f}s", f"{ours_t:>12.3f}s"
-        print(f"{name:<52}{n}{o}{ratio:>9.1f}x")
+    def row(label, t_ours, t_ref):
+        ratio = t_ref / t_ours if t_ours else float("nan")
+        print(f"{label:<30}{t_ours:>14.3f}s{t_ref:>14.3f}s{ratio:>9.1f}x")
 
-    # 1. metadata only  -----------------------------------------------------
-    t_np_meta = timeit(lambda: _np_metadata(path))
-    t_rs_meta = timeit(lambda: pt.read_metadata(path))
-    row("metadata (groups/channels/properties)", t_np_meta, t_rs_meta, unit="ms")
+    if equal_length:
+        channels = [r.channel for r in requests]
+        t_ours_full = timeit(lambda: pt.read_tdms(path, group=group,chunk_size=None), repeat, warmup)
+        t_ref_full = timeit(lambda: _nptdms_read_group(path, group), repeat, warmup)
+        row("full group read", t_ours_full, t_ref_full)
 
-    # 2. full read ----------------------------------------------------------
-    def np_full():
-        from nptdms import TdmsFile
+    else:
+        print("channels differ in length, benchmarking per channel only ...")
 
-        return TdmsFile.read(path).as_dataframe()
-
-    t_np_full = timeit(np_full, repeat=2)
-    rss_np_full = peak_rss_mib("nptdms_full", path, group, [])
-
-    def rs_full():
-        pt.read_tdms(path, group=group)
-
-    t_rs_full = timeit(rs_full, repeat=2)
-    rss_rs_full = peak_rss_mib("polars_full", path, group, [])
-    row("full group read", t_np_full, t_rs_full)
-
-    # 2b. full read, lazy entry point ---------------------------------------
-    t_rs_lazy = timeit(lambda: pt.scan_tdms(path, group=group).collect(), repeat=2)
-    print(f"{'lazy scan_tdms(...).collect()':<52}{'-':>14}{t_rs_lazy:>12.3f}s{'':>10}")
-
-    # 3. partial read (2 of N channels) -------------------------------------
-    keep = [f"Ch{i}" for i in range(min(2, channels))]
-
-    def np_partial():
-        from nptdms import TdmsFile
-
-        return TdmsFile.read(path).as_dataframe().iloc[:, : len(keep)]
-
-    t_np_partial = timeit(np_partial, repeat=2)
-    rss_np_partial = peak_rss_mib("nptdms_partial", path, group, keep)
-
-    def rs_partial():
-        pt.read_tdms(path, group=group, columns=keep)
-
-    t_rs_partial = timeit(rs_partial, repeat=2)
-    rss_rs_partial = peak_rss_mib("polars_partial", path, group, keep)
-    row("partial read (2 channels)", t_np_partial, t_rs_partial)
-
-    # 4. peak memory during full read ---------------------------------------
-    print(f"\npeak RSS during full read: nptdms={rss_np_full:.0f} MiB, "
-          f"polars_tdms={rss_rs_full:.0f} MiB, "
-          f"ratio={rss_np_full/max(rss_rs_full,1):.1f}x")
-    print(f"peak RSS during partial read: nptdms={rss_np_partial:.0f} MiB, "
-          f"polars_tdms={rss_rs_partial:.0f} MiB, "
-          f"ratio={rss_np_partial/max(rss_rs_partial,1):.1f}x")
-    print("(RSS = resident set after the read in a fresh subprocess)")
-
-    # 5. correctness check ---------------------------------------------------
-    ours = pt.read_tdms(path, group=group, columns=keep)
-    from nptdms import TdmsFile
-
-    ref = TdmsFile.read(path)
-    ok = all(np.allclose(ref[group][c][:], ours[c].to_numpy()) for c in keep)
-    print(f"\nvalues match nptdms: {ok}")
+    print("\nper-channel breakdown:")
+    for r in requests:
+        t_ours_c = timeit(
+            lambda r=r: pt.read_tdms(path, group=group, columns=[r.name]), repeat, warmup
+        )
+        t_ref_c = timeit(
+            lambda r=r: _nptdms_read_channel(path, group, r.channel), repeat, warmup
+        )
+        row(f"{r.name} ({r.dtype})", t_ours_c, t_ref_c)
 
 
-def _np_metadata(path):
-    from nptdms import TdmsFile
+def _resolve_requests(meta: pt.TdmsMetadata, group: str, columns: list[str] | None) -> list[_Req]:
+    grp = meta.group(group)
+    if grp is None:
+        raise ValueError(
+            f"group {group!r} not found in {meta.path!r}; available: {list(meta.group_names)}"
+        )
+    keep = [c for c in grp.channels if c.readable]
+    if columns:
+        missing = set(columns) - {c.name for c in keep}
+        if missing:
+            raise ValueError(f"columns not found (or not readable): {sorted(missing)}")
+        keep = [c for c in keep if c.name in columns]
+    return [_Req(name=c.name, channel=c.name, dtype=c.dtype, length=c.length) for c in keep]
 
-    return TdmsFile.read(path).groups()
 
-
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--samples", type=int, default=2_000_000)
-    ap.add_argument("--channels", type=int, default=8)
-    ap.add_argument("--path", default="/tmp/opencode/bench.tdms")
-    ap.add_argument("--skip-write", action="store_true", help="reuse an existing file")
+    ap.add_argument("file", help="path to an existing .tdms file")
+    ap.add_argument("group", help="group name to benchmark")
+    ap.add_argument("--columns", nargs="*", help="restrict timing to these channels")
+    ap.add_argument("--repeat", type=int, default=3)
+    ap.add_argument("--warmup", type=int, default=1)
     args = ap.parse_args()
 
-    nptdms_ver = importlib.metadata.version("nptdms")
-    print(f"nptdms {nptdms_ver} · polars {pl.__version__} · samples={args.samples} "
-          f"channels={args.channels}")
-    if not args.skip_write:
-        print(f"writing {args.samples*args.channels*8/1e6:.0f} MiB of f64 channel data ...")
-        make_file(args.path, args.samples, args.channels)
+    path = Path(args.file)
+    if not path.is_file():
+        print(f"error: {path} does not exist", file=sys.stderr)
+        return 1
 
-    bench(args.path, GROUP, args.channels)
+    meta = pt.read_metadata(path)
+    try:
+        requests = _resolve_requests(meta, args.group, args.columns)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not requests:
+        print(f"error: group {args.group!r} has no readable channel data", file=sys.stderr)
+        return 1
+
+    print(f"file: {path} ({path.stat().st_size / 1e6:.1f} MB)")
+    print(f"group: {args.group} · channels: "
+          f"{', '.join(f'{r.channel}({r.dtype})' for r in requests)}")
+    print("pyarrow path: " + ("enabled" if pt._pa is not None else "FALLBACK (numpy)"))
+    print(f"samples: {requests[0].length}")
+
+    print("\ncorrectness vs nptdms:")
+    if not check_values(path, args.group, requests):
+        print("content check FAILED — results below are not meaningful")
+        return 1
+
+    print("\n" + "─" * 30)
+    bench(path, args.group, requests,  args.repeat, args.warmup)
+    return 0
 
 
 if __name__ == "__main__":

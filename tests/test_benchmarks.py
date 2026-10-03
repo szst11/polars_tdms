@@ -113,3 +113,24 @@ def test_bench_file_vs_nptdms_missing_file(tmp_path):
     res = _run_script("bench_file_vs_nptdms.py", [str(tmp_path / "nope.tdms"), "G"])
     assert res.returncode != 0
     assert "does not exist" in res.stderr
+
+
+def test_bench_tdms_index_runs(tmp_path):
+    res = _run_script(
+        "bench_tdms_index.py",
+        ["--n-files=3", "--samples=200", f"--path={tmp_path}"],
+    )
+    assert res.returncode == 0, res.stderr
+    out = res.stdout
+    for marker in (
+        "without index",
+        "with index",
+        "index generation",
+        "index files present and valid",
+        "speedup",
+        "no channel data read",
+        "build vertical lazy union",
+        "correctness: rows/channel=True, columns=True, union schema=True",
+    ):
+        assert marker in out, f"missing {marker!r} in output:\n{out}"
+    assert (tmp_path / "data_000.tdms_index").exists()
