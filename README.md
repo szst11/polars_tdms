@@ -58,8 +58,9 @@ skipped when building frames.
 
 ### `.tdms_index` companion files
 
-Every entry point also accepts `use_index_file=True`, `create_index_if_missing=True`
-and `verify_index=False` (matching `tdms-rs` `OpenOptions`). When a sibling
+Every entry point also accepts `use_index_file=True`, `create_index_if_missing=True`,
+`verify_index=False` (matching `tdms-rs` `OpenOptions`) and `copy_to_temp=False`
+(read a temporary copy of the file, optionally with its index). When a sibling
 `<file>.tdms_index` exists it is used to build the metadata index quickly, so
 opening a large file scans the small index instead of the raw data. A missing,
 empty, stale, or corrupt index falls back to the data file and — unless
@@ -68,8 +69,8 @@ re-parses both files and raises `ValueError` on a mismatch.
 
 ## Benchmarks
 
-All scripts live in `benchmarks/`. The two synthetic scripts accept
-`--skip-write` to reuse a previously generated file instead of rewriting it.
+All scripts live in `benchmarks/`. The synthetic script accepts `--skip-write`
+to reuse a previously generated file instead of rewriting it.
 
 | Script | Input | Measures |
 |---|---|---|
@@ -77,9 +78,6 @@ All scripts live in `benchmarks/`. The two synthetic scripts accept
 | `bench_tdms_index.py` | N synthetic files of identical structure, mixed content, many segments (~500 MB total) | vertical lazy-union build (scan + schema, no raw reads) with vs without `.tdms_index` |
 
 ```bash
-uv run --extra bench python benchmarks/bench_vs_nptdms.py \
-    --samples=4000000 --channels=8 --path=/tmp/bench.tdms
-
 uv run --all-extras python benchmarks/bench_file_vs_nptdms.py /path/to/file.tdms DAQ
 
 uv run --all-extras python benchmarks/bench_tdms_index.py \

@@ -40,33 +40,6 @@ def mixed_file(tmp_path_factory):
     return path
 
 
-def test_bench_vs_nptdms_runs(tmp_path):
-    """Smoke-test the synthetic benchmark, including its _rss_runner subprocess.
-
-    This script used to be a byte-for-byte copy of bench_file_vs_nptdms.py,
-    which nothing caught; keep an assertion on its distinctive markers so that
-    cannot regress silently.
-    """
-    res = _run_script(
-        "bench_vs_nptdms.py",
-        ["--samples=200", "--channels=3", f"--path={tmp_path / 'synthetic.tdms'}"],
-    )
-    assert res.returncode == 0, res.stderr
-    out = res.stdout
-    for marker in (
-        "nptdms",
-        "polars",
-        "metadata (groups/channels/properties)",
-        "full group read",
-        "lazy scan_tdms(...).collect()",
-        "partial read (2 channels)",
-        "peak RSS during full read",
-        "peak RSS during partial read",
-        "values match nptdms: True",
-    ):
-        assert marker in out, f"missing {marker!r} in output:\n{out}"
-
-
 def test_bench_file_vs_nptdms_runs(mixed_file, tmp_path):
     res = _run_script("bench_file_vs_nptdms.py", [str(mixed_file), "DAQ"])
     assert res.returncode == 0, res.stderr
