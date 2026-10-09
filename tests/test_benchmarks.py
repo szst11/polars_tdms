@@ -81,6 +81,23 @@ def test_bench_file_vs_nptdms_columns(tmp_path):
     assert "A (Double)" not in out
 
 
+def test_bench_file_vs_nptdms_empty_channel(tmp_path):
+    path = tmp_path / "empty.tdms"
+    with TdmsWriter(path) as w:
+        w.write_segment(
+            [
+                GroupObject("G"),
+                ChannelObject("G", "Signal", np.arange(3, dtype=np.float64)),
+                ChannelObject("G", "Empty", np.array([], dtype=np.float64)),
+            ]
+        )
+
+    res = _run_script("bench_file_vs_nptdms.py", [str(path), "G"])
+    assert res.returncode == 0, res.stderr
+    assert "Empty (Double)" in res.stdout
+    assert "Empty                    matches nptdms: True" in res.stdout
+
+
 def test_bench_file_vs_nptdms_unknown_group(mixed_file):
     res = _run_script("bench_file_vs_nptdms.py", [str(mixed_file), "Missing"])
     assert res.returncode != 0

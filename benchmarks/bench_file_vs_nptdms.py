@@ -77,12 +77,15 @@ def check_values(path: str, group: str, requests: list[_Req]) -> bool:
     ok = True
     for r in requests:
         ref = f[group][r.channel][:]
-        if r.dtype == "String":
-            match = df[r.name].to_list() == ref.tolist()
+        column = df[r.name]
+        if len(ref) == 0:
+            match = column.len() == 0 or column.null_count() == column.len()
+        elif r.dtype == "String":
+            match = column.to_list() == ref.tolist()
         elif r.dtype in ("Float", "Double"):
-            match = bool(np.allclose(df[r.name].to_numpy(), ref, equal_nan=True))
+            match = bool(np.allclose(column.to_numpy(), ref, equal_nan=True))
         else:
-            match = bool(np.array_equal(df[r.name].to_numpy(), ref))
+            match = bool(np.array_equal(column.to_numpy(), ref))
         ok &= match
         print(f"  {r.name:<24} matches nptdms: {match}")
 
@@ -172,17 +175,17 @@ def main() -> int:
         return 1
 
     print(f"file: {path} ({path.stat().st_size / 1e6:.1f} MB)")
-    print(f"group: {args.group} · channels: "
+    print(f"group: {args.group} - channels: "
           f"{', '.join(f'{r.channel}({r.dtype})' for r in requests)}")
     print("pyarrow path: enabled")
     print(f"samples: {requests[0].length}")
 
     print("\ncorrectness vs nptdms:")
     if not check_values(path, args.group, requests):
-        print("content check FAILED — results below are not meaningful")
+        print("content check FAILED -- results below are not meaningful")
         return 1
 
-    print("\n" + "─" * 30)
+    print("\n" + "-" * 30)
     bench(path, args.group, requests,  args.repeat, args.warmup)
     return 0
 
