@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
-tdms-rs = { git = "https://github.com/szst11/tdms-rs.git", rev = "765c7fbc590aad3a3d87a47dd8696cd7ad5f95d0" }
+tdms-rs = { git = "https://github.com/szst11/tdms-rs.git", rev = "02ffbef819fe36a9639306044718edb30dc3082a" }
 
 [profile.release]
 lto = "thin"
