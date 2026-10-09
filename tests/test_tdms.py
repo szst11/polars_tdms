@@ -247,6 +247,25 @@ def test_empty_channel():
         assert df.schema == {"Sig": pl.Float64}
 
 
+def test_empty_channel_is_filled_with_typed_nulls(tmp_path):
+    path = tmp_path / "empty_with_data.tdms"
+    with TdmsWriter(path) as writer:
+        writer.write_segment(
+            [
+                GroupObject("G"),
+                ChannelObject("G", "Signal", np.arange(3, dtype=np.int32)),
+                ChannelObject("G", "Empty", np.array([], dtype=np.float64)),
+            ]
+        )
+
+    df = pt.read_tdms(path, group="G")
+
+    assert df.shape == (3, 2)
+    assert df.schema == {"Signal": pl.Int32, "Empty": pl.Float64}
+    assert df["Signal"].to_list() == [0, 1, 2]
+    assert df["Empty"].to_list() == [None, None, None]
+
+
 @pytest.fixture(scope="module")
 def multiseg_file(tmp_path_factory):
     path = tmp_path_factory.mktemp("tdms") / "multiseg.tdms"

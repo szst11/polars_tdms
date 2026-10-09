@@ -334,14 +334,22 @@ def _read_requested(
 ) -> pl.DataFrame:
     if not requests:
         return pl.DataFrame()
-    lengths = {r.length for r in requests}
-    if len(lengths) > 1:
+    nonempty_lengths = {r.length for r in requests if r.length > 0}
+    if len(nonempty_lengths) > 1:
         details = ", ".join(f"{r.name}={r.length}" for r in requests)
         raise ValueError(
             "requested channels have differing sample counts, which polars "
             f"DataFrames cannot represent as columns of equal length: {details}"
         )
-    columns = [_read_channel_series(handle, r, chunk_size) for r in requests]
+    target_length = next(iter(nonempty_lengths), 0)
+    columns = [
+        (
+            pl.Series(r.name, [None] * target_length, dtype=DTYPE_TO_POLARS[r.dtype])
+            if r.length == 0 and target_length > 0
+            else _read_channel_series(handle, r, chunk_size)
+        )
+        for r in requests
+    ]
     return pl.DataFrame(columns)
 
 
