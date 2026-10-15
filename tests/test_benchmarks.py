@@ -129,3 +129,51 @@ def test_bench_tdms_index_runs(tmp_path):
     ):
         assert marker in out, f"missing {marker!r} in output:\n{out}"
     assert (tmp_path / "data_000.tdms_index").exists()
+
+
+def test_bench_scatter_gather_runs(mixed_file):
+    res = _run_script(
+        "bench_scatter_gather.py",
+        [str(mixed_file), "DAQ", "--repeat", "1", "--warmup", "0"],
+    )
+    assert res.returncode == 0, res.stderr
+    for marker in (
+        "scatter-gather experiment",
+        "vectored: matches nptdms: True",
+        "coalesced: matches nptdms: True",
+        "fragments:",
+        "current raw (reused metadata)",
+        "production batched raw (Rust index)",
+        "legacy full group (includes open)",
+        "production==legacy full group: True",
+        "vectored raw (reused plan)",
+        "coalesced full group + plan",
+        "full group equality (including normal string/boolean reads): True",
+    ):
+        assert marker in res.stdout, f"missing {marker!r} in output:\n{res.stdout}"
+
+
+def test_bench_scatter_gather_selection(mixed_file):
+    res = _run_script(
+        "bench_scatter_gather.py",
+        [str(mixed_file), "DAQ", "--columns", "Counts", "--repeat", "1", "--warmup", "0"],
+    )
+    assert res.returncode == 0, res.stderr
+    assert "numeric channels: 1; fragments: 2" in res.stdout
+    assert "full group equality (including normal string/boolean reads): True" in res.stdout
+
+
+def test_bench_scatter_gather_unequal_lengths(tmp_path):
+    path = tmp_path / "unequal.tdms"
+    with TdmsWriter(path) as writer:
+        writer.write_segment([
+            ChannelObject("G", "A", np.arange(3, dtype=np.int32)),
+            ChannelObject("G", "B", np.arange(5, dtype=np.int32)),
+        ])
+    res = _run_script(
+        "bench_scatter_gather.py",
+        [str(path), "G", "--repeat", "1", "--warmup", "0"],
+    )
+    assert res.returncode == 0, res.stderr
+    assert "coalesced: matches nptdms: True" in res.stdout
+    assert "full group comparison: skipped (channels differ in length)" in res.stdout

@@ -6,6 +6,8 @@ use std::ops::Range;
 use tdms_rs::api::reader::TdmsChannel;
 use tdms_rs::{DataType, OpenOptions, PropertyValue, TdmsError, TdmsFile};
 
+mod scatter;
+
 fn tdms_err(e: TdmsError) -> PyErr {
     PyValueError::new_err(format!("TDMS error: {e}"))
 }
@@ -18,8 +20,9 @@ fn channel_by_name<'a>(
     let g = file
         .group(group)
         .ok_or_else(|| PyKeyError::new_err(format!("group {group:?} not found in file")))?;
-    g.channel(channel)
-        .ok_or_else(|| PyKeyError::new_err(format!("channel {channel:?} not found in group {group:?}")))
+    g.channel(channel).ok_or_else(|| {
+        PyKeyError::new_err(format!("channel {channel:?} not found in group {group:?}"))
+    })
 }
 
 fn dtype_name(dt: &DataType) -> &'static str {
@@ -46,10 +49,7 @@ fn dtype_name(dt: &DataType) -> &'static str {
 /// TimeStamp properties are returned as a `(seconds, fraction)` tuple where
 /// `fraction` counts 2^64-ths of a second since the TDMS/LabVIEW epoch
 /// (1904-01-01). The high-level Python API converts these to `datetime`.
-fn property_to_py<'py>(
-    py: Python<'py>,
-    v: &PropertyValue,
-) -> PyResult<Py<PyAny>> {
+fn property_to_py<'py>(py: Python<'py>, v: &PropertyValue) -> PyResult<Py<PyAny>> {
     Ok(match v {
         PropertyValue::I8(x) => x.into_pyobject(py)?.into_any().unbind(),
         PropertyValue::I16(x) => x.into_pyobject(py)?.into_any().unbind(),
@@ -83,7 +83,6 @@ fn properties_to_dict<'a>(
     Ok(d.unbind())
 }
 
-
 /// Read a range of POD (numeric / boolean) samples from a channel as raw
 /// bytes in Arrow's layout: explicit little-endian for numerics (regardless of
 /// host byte order) and a packed LSB-first bitmap for Boolean. Returns the
@@ -100,9 +99,8 @@ fn read_channel_into_bytes(
             channel.read(range, &mut buf).map_err(tdms_err)?;
             if cfg!(target_endian = "little") {
                 let ptr = buf.as_ptr() as *const u8;
-                let slice = unsafe {
-                    std::slice::from_raw_parts(ptr, len * std::mem::size_of::<$ty>())
-                };
+                let slice =
+                    unsafe { std::slice::from_raw_parts(ptr, len * std::mem::size_of::<$ty>()) };
                 PyBytes::new(py, slice).unbind()
             } else {
                 let mut out: Vec<u8> = Vec::with_capacity(len * std::mem::size_of::<$ty>());
@@ -158,6 +156,7 @@ fn read_channel_into_bytes(
 #[pyclass(module = "polars_tdms._core")]
 struct TdmsHandle {
     file: TdmsFile,
+    path: String,
 }
 
 #[pymethods]
@@ -176,7 +175,10 @@ impl TdmsHandle {
             .verify_index(verify_index)
             .open(path)
             .map_err(tdms_err)?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+        })
     }
 
     /// Names of all groups in the file.
@@ -232,7 +234,6 @@ impl TdmsHandle {
         Ok(meta.unbind())
     }
 
-
     /// Read a range of string samples as Arrow string buffers: cumulative
     /// i64 offsets (little-endian) followed by the concatenated UTF-8 bytes.
     /// Returns `(offsets, data)`. The two buffers are exactly the payload of an
@@ -278,10 +279,141 @@ impl TdmsHandle {
         start: usize,
         end: usize,
     ) -> PyResult<Py<PyBytes>> {
+        let mut buffers = self.read_channels_range_buffers(
+            py,
+            vec![(group.to_owned(), channel.to_owned())],
+            start,
+            end,
+        )?;
+        Ok(buffers.remove(0))
+    }
+
+    /// Read selected fixed-width channels together, coalescing adjacent file
+    /// fragments. Only the supplied channels receive output buffers.
+    fn read_channels_range_buffers(
+        &self,
+        py: Python<'_>,
+        channels: Vec<(String, String)>,
+        start: usize,
+        end: usize,
+    ) -> PyResult<Vec<Py<PyBytes>>> {
         if end < start {
             return Err(PyValueError::new_err(
-                "read_channel_range_buffers: end must be >= start",
+                "read_channels_range_buffers: end must be >= start",
             ));
+        }
+        let count = end - start;
+        let mut sizes = Vec::with_capacity(channels.len());
+        let mut dtypes = Vec::with_capacity(channels.len());
+        let mut fragments = Vec::new();
+        let mut swaps = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (index, (group, channel)) in channels.iter().enumerate() {
+            if !seen.insert((group, channel)) {
+                return Err(PyValueError::new_err("duplicate channel in batch"));
+            }
+            let c = channel_by_name(&self.file, group, channel)?;
+            let dtype = c.dtype();
+            match dtype {
+                DataType::String => {
+                    return Err(PyNotImplementedError::new_err(
+                        "String channels must be read via read_channel_strings_buffers",
+                    ))
+                }
+                DataType::Void | DataType::TimeStamp => {
+                    return Err(PyNotImplementedError::new_err(format!(
+                        "channel data type {dtype:?} cannot be read as samples (metadata only)"
+                    )))
+                }
+                _ => {}
+            }
+            if end > c.len() {
+                return Err(tdms_err(TdmsError::InvalidRange(start, end, c.len())));
+            }
+            let width = dtype.itemsize();
+            let size = count
+                .checked_mul(width)
+                .ok_or_else(|| PyValueError::new_err("requested channel byte length overflows"))?;
+            sizes.push(size);
+            dtypes.push(dtype);
+            let mut skip = start;
+            let mut remaining = count;
+            let mut target = 0;
+            for loc in c.data_locations() {
+                if remaining == 0 {
+                    break;
+                }
+                let available = usize::try_from(loc.number_of_values).map_err(|_| {
+                    PyValueError::new_err("fragment sample count exceeds address space")
+                })?;
+                if skip >= available {
+                    skip -= available;
+                    continue;
+                }
+                let take = remaining.min(available - skip);
+                let byte_skip = skip
+                    .checked_mul(width)
+                    .ok_or_else(|| PyValueError::new_err("fragment byte offset overflows"))?;
+                let offset = loc
+                    .offset
+                    .checked_add(byte_skip as u64)
+                    .ok_or_else(|| PyValueError::new_err("fragment file offset overflows"))?;
+                let len = take * width;
+                fragments.push((offset, index, target, len));
+                if loc.big_endian && width > 1 {
+                    swaps.push((index, target, len, width));
+                }
+                target += len;
+                remaining -= take;
+                skip = 0;
+            }
+            if remaining != 0 {
+                return Err(PyValueError::new_err(
+                    "channel fragment index does not cover requested range",
+                ));
+            }
+        }
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut raw = scatter::read_buffers(&self.path, &sizes, fragments, "coalesced")?;
+        for (index, target, len, width) in swaps {
+            let base = raw.bases[index] + target;
+            for value in raw.data[base..base + len].chunks_exact_mut(width) {
+                value.reverse();
+            }
+        }
+        Ok(dtypes
+            .iter()
+            .enumerate()
+            .map(|(index, dtype)| {
+                let data = &raw.data[raw.bases[index]..raw.bases[index + 1]];
+                if *dtype == DataType::Boolean {
+                    let mut packed = vec![0u8; count.div_ceil(8)];
+                    for (i, &value) in data.iter().enumerate() {
+                        if value != 0 {
+                            packed[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    PyBytes::new(py, &packed).unbind()
+                } else {
+                    PyBytes::new(py, data).unbind()
+                }
+            })
+            .collect())
+    }
+
+    /// Benchmark reference retaining the former per-channel tdms-rs reader.
+    fn _read_channel_range_buffers_scalar(
+        &self,
+        py: Python<'_>,
+        group: &str,
+        channel: &str,
+        start: usize,
+        end: usize,
+    ) -> PyResult<Py<PyBytes>> {
+        if end < start {
+            return Err(PyValueError::new_err("end must be >= start"));
         }
         let c = channel_by_name(&self.file, group, channel)?;
         read_channel_into_bytes(py, &c, start..end)
@@ -291,6 +423,7 @@ impl TdmsHandle {
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TdmsHandle>()?;
+    m.add_function(wrap_pyfunction!(scatter::_read_fragment_buffers, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

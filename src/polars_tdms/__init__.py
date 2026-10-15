@@ -342,10 +342,32 @@ def _read_requested(
             f"DataFrames cannot represent as columns of equal length: {details}"
         )
     target_length = next(iter(nonempty_lengths), 0)
+    numeric = [r for r in requests if r.length > 0 and r.dtype != "String"]
+    batched: dict[str, pl.Series] = {}
+    if len(numeric) > 1:
+        size = (
+            target_length
+            if chunk_size is None or chunk_size <= 0
+            else chunk_size
+        )
+        pieces: dict[str, list[pl.Series]] = {r.name: [] for r in numeric}
+        channels = [(r.group, r.channel) for r in numeric]
+        for start in range(0, target_length, size):
+            end = min(start + size, target_length)
+            buffers = handle.read_channels_range_buffers(channels, start, end)
+            for req, data in zip(numeric, buffers, strict=True):
+                pieces[req.name].append(
+                    _series_from_numeric_buffers(req.name, req.dtype, data, end - start)
+                )
+        batched = {
+            name: chunks[0] if len(chunks) == 1 else pl.concat(chunks, rechunk=False)
+            for name, chunks in pieces.items()
+        }
     columns = [
         (
             pl.Series(r.name, [None] * target_length, dtype=DTYPE_TO_POLARS[r.dtype])
             if r.length == 0 and target_length > 0
+            else batched[r.name] if r.name in batched
             else _read_channel_series(handle, r, chunk_size)
         )
         for r in requests
