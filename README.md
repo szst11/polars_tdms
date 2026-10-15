@@ -13,11 +13,11 @@ uv sync                       # library only (requires Rust toolchain)
 
 Rust ≥ 1.75 required at build time.
 
-This branch temporarily patches `tdms-rs` to the sibling `../tdms-rs` checkout,
-which adds the read-only `TdmsChannel.data_locations()` API. Builds require that
-checkout with the API change. Once the parser change is published, update the
-pinned Git revision in `Cargo.toml` and remove the local `[patch]` section before
-distributing wheels or source archives.
+This branch uses `tdms-rs` from the sibling `../tdms-rs` checkout, which adds the
+read-only `TdmsChannel.data_locations()` API and optimized index generation.
+Builds require that modified checkout. Once the parser changes are published,
+replace the local path dependency in `Cargo.toml` with a pinned Git revision
+before distributing wheels or source archives.
 
 ## Quick start
 
@@ -73,6 +73,11 @@ empty, stale, or corrupt index falls back to the data file and — unless
 `create_index_if_missing=False` — is regenerated best-effort. `verify_index=True`
 re-parses both files and raises `ValueError` on a mismatch.
 
+Initial index generation uses a bounded 4 MiB write buffer to avoid hundreds
+of small writes for metadata-heavy files on high-latency storage. The index
+format is unchanged; indexes smaller than the buffer are emitted in one final
+write, and the final buffer is flushed before atomic publication.
+
 ## Benchmarks
 
 All scripts live in `benchmarks/`. The synthetic script accepts `--skip-write`
@@ -82,6 +87,7 @@ to reuse a previously generated file instead of rewriting it.
 |---|---|---|
 | `bench_file_vs_nptdms.py` | an existing file + group (positional args) | pyarrow path vs nptdms, full/chunked/per-channel |
 | `bench_tdms_index.py` | N synthetic files of identical structure, mixed content, many segments (~500 MB total) | vertical lazy-union build (scan + schema, no raw reads) with vs without `.tdms_index` |
+| `bench_index_creation.py` | an existing file or folder of `.tdms` files | metadata scan vs first-index creation vs existing-index open on temporary copies |
 | `bench_scatter_gather.py` | an existing file + group, optional `--columns` | experimental Rust scalar/vectored/coalesced reads vs current reader |
 
 ```bash
@@ -91,8 +97,68 @@ uv run --all-extras python benchmarks/bench_tdms_index.py \
     --n-files=100 --samples=200000 --segments=200
 ```
 
-Each script first verifies polars_tdms values against nptdms and only reports
-timings once the read is known to be correct.
+Scripts verify data values or metadata against nptdms and only report timings
+once their correctness checks pass.
+
+### First-index creation
+
+```powershell
+conda activate uv_rust
+uv run --all-extras python benchmarks\bench_index_creation.py "F:\data\folder" --repeat 7
+```
+
+This benchmark preserves original files and companion indexes. Temporary copies
+are created beside the inputs to measure the same filesystem (`--workspace`
+overrides that location). Copying, cleanup, and correctness checks are excluded
+from the reported best/median timings. Each first-open measurement starts with
+no index, verifies that an index was actually generated, compares metadata with
+unindexed and indexed opens, and checks `verify_index=True`. Group/channel names
+and lengths are also checked against nptdms. Repeated reads use the OS cache;
+these are not cold-storage measurements.
+
+On three supplied ~23.63 MB files on `F:`, each producing a ~1.93 MB index,
+7 measured opens after 1 warmup gave these median **scan + index creation**
+times on temporary copies on the same drive:
+
+| File suffix | Former 8 KiB write buffer | Bounded 4 MiB buffer |
+|---|---:|---:|
+| `179_2025618161517.tdms` | 493.7 ms | 216.3 ms |
+| `180_2025618161517.tdms` | 480.4 ms | 185.4 ms |
+| `182_2025618161517.tdms` | 547.4 ms | 224.8 ms |
+
+That is approximately 2.3-2.6x faster for first-index creation. Scanning
+metadata without writing an index remained around 50-55 ms. A 1 MiB-buffer
+trial was also much faster than the default, but the filesystem timing
+variation did not demonstrate a consistent additional benefit from 4 MiB.
+The 4 MiB buffer lets these indexes be submitted as one final write while
+keeping memory bounded for larger files. Existing-index opens and the
+remaining filesystem create/flush/rename latency are not eliminated.
+
+#### Position tracking and buffered skips
+
+Metadata scans now track logical read positions in Rust instead of querying
+the file position around every segment. Nearby seeks preserve the existing
+read buffer when possible. This changes neither the 4 MiB index writer nor
+the index format.
+
+A paired comparison loaded the previous and optimized compiled extensions in
+the same process, alternating their execution order on safe same-drive copies.
+Both versions retained the 4 MiB writer. After 3 warmups, a 21-run confirmation
+gave these medians:
+
+| File suffix | Metadata scan, before / after | Existing index, before / after | First index, before / after |
+|---|---:|---:|---:|
+| `179_2025618161517.tdms` | 45.4 / 35.4 ms | 51.7 / 47.6 ms | 214.5 / 176.7 ms |
+| `180_2025618161517.tdms` | 39.1 / 33.3 ms | 44.1 / 41.7 ms | 187.2 / 176.8 ms |
+| `182_2025618161517.tdms` | 39.0 / 33.0 ms | 46.7 / 43.7 ms | 202.1 / 193.7 ms |
+
+Across the initial 15-run comparison and this confirmation, median paired
+speedups were 1.14-1.20x for metadata scans and 1.06-1.12x for indexed opens.
+First-index creation was much noisier: the initial comparison gave paired
+speedups of 1.03x, 0.95x, and 1.02x. The position optimization therefore helps
+parsing consistently, but a substantial reduction in first-index creation
+latency is not established. Metadata equality and `verify_index=True` passed
+for every measured open.
 
 ### Scatter-gather experiment
 

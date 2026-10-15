@@ -177,3 +177,53 @@ def test_bench_scatter_gather_unequal_lengths(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "coalesced: matches nptdms: True" in res.stdout
     assert "full group comparison: skipped (channels differ in length)" in res.stdout
+
+
+def test_bench_index_creation_preserves_originals(mixed_file, tmp_path):
+    path = tmp_path / mixed_file.name
+    path.write_bytes(mixed_file.read_bytes())
+    index = Path(f"{path}_index")
+    index.write_bytes(b"existing index must not be changed")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    res = _run_script(
+        "bench_index_creation.py",
+        [str(tmp_path), "--repeat", "2", "--warmup", "1"],
+    )
+    assert res.returncode == 0, res.stderr
+    for marker in (
+        "first-index creation benchmark",
+        "files: 1",
+        "temporary copies only; original files and indexes preserved",
+        "metadata scan, no index",
+        "first open + index creation",
+        "existing index open",
+        "correctness: nptdms structure=True, metadata equality=True, verify_index=True",
+    ):
+        assert marker in res.stdout, f"missing {marker!r} in output:\n{res.stdout}"
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+
+
+def test_bench_index_creation_file_and_workspace(mixed_file, tmp_path):
+    res = _run_script(
+        "bench_index_creation.py",
+        [str(mixed_file), "--workspace", str(tmp_path), "--repeat", "1", "--warmup", "0"],
+    )
+    assert res.returncode == 0, res.stderr
+    assert "first open + index creation" in res.stdout
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("extra,message", [
+    (["--repeat", "0"], "repeat must be positive"),
+    (["--warmup", "-1"], "warmup nonnegative"),
+])
+def test_bench_index_creation_invalid_counts(mixed_file, extra, message):
+    res = _run_script("bench_index_creation.py", [str(mixed_file), *extra])
+    assert res.returncode != 0
+    assert message in res.stderr
+
+
+def test_bench_index_creation_empty_folder(tmp_path):
+    res = _run_script("bench_index_creation.py", [str(tmp_path)])
+    assert res.returncode != 0
+    assert "no TDMS files found" in res.stderr
