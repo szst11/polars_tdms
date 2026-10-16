@@ -1,6 +1,6 @@
 [package]
 name = "polars-tdms-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Rust core (PyO3) for the polars-tdms IO extension"
 
@@ -10,7 +10,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module"] }
-tdms-rs = { git = "https://github.com/szst11/tdms-rs.git", rev = "02ffbef819fe36a9639306044718edb30dc3082a" }
+tdms-rs = { git = "https://github.com/szst11/tdms-rs.git", rev = "26d9911866f30b768c6c2ffe5f8f6e27f66baa0c" }
+#[patch."https://github.com/szst11/tdms-rs.git"]
+# Local fragment-index API; replace this patch with a published revision.
+#tdms-rs = { path = "../tdms-rs" }
 
 [profile.release]
 lto = "thin"

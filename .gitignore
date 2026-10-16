@@ -190,3 +190,12 @@ Cargo.lock
 *.pdb
 
 # End of https://www.toptal.com/developers/gitignore/api/python,rust
+
+# Python compiled extension modules
+*.pyd
+*.so
+*.dylib
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -14,9 +14,10 @@ Memory efficiency
 -----------------
 ``tdms-rs`` indexes all segment metadata eagerly but never loads raw data.
 ``scan_tdms`` exploits that: constructing the lazy frame is O(metadata) only.
-At ``collect()`` time only the requested group/channels are read, and large
-channels are streamed in chunks of ``chunk_size`` samples (default 1M) so the
-peak memory footprint stays bounded even for multi-GB files.
+At execution time only the requested group/channels are read, in row batches
+of at most ``chunk_size`` samples (default 1M). Streaming sinks can consume
+these batches without materializing all selected data. ``collect()`` still
+retains the complete result, and blocking query operations may buffer data.
 """
 
 from __future__ import annotations
@@ -25,12 +26,13 @@ import datetime as _dt
 import os
 import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Self
 
 import polars as pl
 import pyarrow as pa
+from polars.io.plugins import register_io_source
 
 from . import _core
 
@@ -48,7 +50,7 @@ __all__ = [
     "scan_tdms",
 ]
 
-# Number of samples read per chunk when materializing a large channel.
+# Maximum number of samples per source batch.
 DEFAULT_CHUNK_SIZE = 1_000_000
 
 # TDMS "zero" time: the LabVIEW epoch used for timestamps.
@@ -276,80 +278,41 @@ def _series_from_numeric_buffers(name: str, dtype: str, data: bytes, n: int) -> 
     return pl.Series(name, arr)
 
 
-def _read_numeric_channel_series(
-    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
-) -> pl.Series:
-    if chunk_size is None or chunk_size <= 0 or chunk_size >= req.length:
-        data = handle.read_channel_range_buffers(req.group, req.channel, 0, req.length)
-        return _series_from_numeric_buffers(req.name, req.dtype, data, req.length)
-
-    pieces: list[pl.Series] = []
-    for start in range(0, req.length, chunk_size):
-        end = min(start + chunk_size, req.length)
-        data = handle.read_channel_range_buffers(req.group, req.channel, start, end)
-        pieces.append(
-            _series_from_numeric_buffers(req.name, req.dtype, data, end - start)
-        )
-    if len(pieces) == 1:
-        return pieces[0]
-    return pl.concat(pieces, rechunk=False)
-
-
-def _read_string_channel_series(
-    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
-) -> pl.Series:
-    if chunk_size is None or chunk_size <= 0 or chunk_size >= req.length:
-        offsets, data = handle.read_channel_strings_buffers(
-            req.group, req.channel, 0, req.length
-        )
-        return _series_from_string_buffers(req.name, offsets, data, req.length)
-
-    pieces: list[pl.Series] = []
-    for start in range(0, req.length, chunk_size):
-        end = min(start + chunk_size, req.length)
-        offsets, data = handle.read_channel_strings_buffers(
-            req.group, req.channel, start, end
-        )
-        pieces.append(_series_from_string_buffers(req.name, offsets, data, end - start))
-    if len(pieces) == 1:
-        return pieces[0]
-    return pl.concat(pieces, rechunk=False)
-
-
-def _read_channel_series(
-    handle: _core.TdmsHandle, req: _ChannelRequest, chunk_size: int | None
-) -> pl.Series:
-    if req.length == 0:
-        return pl.Series(req.name, [], dtype=DTYPE_TO_POLARS[req.dtype])
-
-    if req.dtype == "String":
-        return _read_string_channel_series(handle, req, chunk_size)
-    return _read_numeric_channel_series(handle, req, chunk_size)
-
-
-def _read_requested(
+def _read_requested_range(
     handle: _core.TdmsHandle,
     requests: Sequence[_ChannelRequest],
-    chunk_size: int | None,
+    start: int,
+    end: int,
 ) -> pl.DataFrame:
-    if not requests:
-        return pl.DataFrame()
-    nonempty_lengths = {r.length for r in requests if r.length > 0}
-    if len(nonempty_lengths) > 1:
-        details = ", ".join(f"{r.name}={r.length}" for r in requests)
-        raise ValueError(
-            "requested channels have differing sample counts, which polars "
-            f"DataFrames cannot represent as columns of equal length: {details}"
-        )
-    target_length = next(iter(nonempty_lengths), 0)
-    columns = [
-        (
-            pl.Series(r.name, [None] * target_length, dtype=DTYPE_TO_POLARS[r.dtype])
-            if r.length == 0 and target_length > 0
-            else _read_channel_series(handle, r, chunk_size)
-        )
-        for r in requests
-    ]
+    length = end - start
+    numeric = [r for r in requests if r.length > 0 and r.dtype != "String"]
+    batched: dict[str, pl.Series] = {}
+    if len(numeric) > 1:
+        channels = [(r.group, r.channel) for r in numeric]
+        buffers = handle.read_channels_range_buffers(channels, start, end)
+        batched = {
+            req.name: _series_from_numeric_buffers(req.name, req.dtype, data, length)
+            for req, data in zip(numeric, buffers, strict=True)
+        }
+    columns: list[pl.Series] = []
+    for req in requests:
+        if req.length == 0:
+            series = pl.Series(
+                req.name, [None], dtype=DTYPE_TO_POLARS[req.dtype]
+            ).new_from_index(0, length)
+        elif req.name in batched:
+            series = batched[req.name]
+        elif req.dtype == "String":
+            offsets, data = handle.read_channel_strings_buffers(
+                req.group, req.channel, start, end
+            )
+            series = _series_from_string_buffers(req.name, offsets, data, length)
+        else:
+            data = handle.read_channel_range_buffers(
+                req.group, req.channel, start, end
+            )
+            series = _series_from_numeric_buffers(req.name, req.dtype, data, length)
+        columns.append(series)
     return pl.DataFrame(columns)
 
 
@@ -430,9 +393,10 @@ class TdmsSource:
     ) -> pl.LazyFrame:
         """Return a ``LazyFrame`` over the requested group/channels.
 
-        The TDMS data is not read until the returned frame is collected.
+        The TDMS data is not read until the returned frame is executed.
         Thanks to projection pushdown, ``scan(...).select([...]).collect()``
-        only loads the selected channels.
+        only loads the selected channels. Streaming sinks consume successive
+        row batches without loading the complete selection into memory.
 
         Parameters
         ----------
@@ -443,8 +407,9 @@ class TdmsSource:
         columns:
             Optional subset of channels to load.
         chunk_size:
-            Samples read per chunk for channels wider than this (memory bound).
-            Pass ``None`` to load each channel in a single allocation.
+            Maximum samples per source batch; Polars may request smaller batches.
+            Pass ``None`` or a nonpositive value to read the whole selection in
+            one batch (disables bounded-memory source streaming).
         """
         meta = self.metadata
         if self._handle is None:
@@ -458,34 +423,60 @@ class TdmsSource:
         if not schema:
             raise ValueError(f"no readable channel data in {self._path!r}")
 
-        def _load_batch(_in: pl.DataFrame) -> pl.DataFrame:
+        def _read_batches(
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
+        ) -> Iterator[pl.DataFrame]:
             _ = temporary_directory
-            wanted = set(_in.columns)
-            selected = [r for r in requests if r.name in wanted]
-            if not selected:
-                return pl.DataFrame(schema=schema)
-            loaded = _read_requested(handle, selected, chunk_size)
-            selected_names = {r.name for r in selected}
-            return pl.DataFrame(
-                [
-                    loaded.get_column(r.name)
-                    if r.name in selected_names
-                    else pl.Series(r.name, [None], dtype=schema[r.name]).new_from_index(
-                        0, loaded.height
-                    )
-                    for r in requests
-                ]
+            by_name = {r.name: r for r in requests}
+            selected = (
+                requests if with_columns is None
+                else [by_name[name] for name in with_columns]
             )
+            nonempty_lengths = {r.length for r in selected if r.length > 0}
+            if len(nonempty_lengths) > 1:
+                details = ", ".join(f"{r.name}={r.length}" for r in selected)
+                raise ValueError(
+                    "requested channels have differing sample counts, which polars "
+                    f"DataFrames cannot represent as columns of equal length: {details}"
+                )
+            target_length = next(
+                iter(nonempty_lengths), max(r.length for r in requests)
+            )
+            if predicate is None and n_rows is not None:
+                target_length = min(target_length, n_rows)
+            if target_length == 0 or n_rows == 0:
+                yield pl.DataFrame(
+                    schema={r.name: DTYPE_TO_POLARS[r.dtype] for r in selected}
+                )
+                return
+            size = target_length
+            if chunk_size is not None and chunk_size > 0:
+                size = chunk_size
+                if batch_size is not None and batch_size > 0:
+                    size = min(size, batch_size)
+            remaining = n_rows
+            for start in range(0, target_length, size):
+                end = min(start + size, target_length)
+                batch = (
+                    _read_requested_range(handle, selected, start, end)
+                    if selected else pl.DataFrame([{}] * (end - start))
+                )
+                if predicate is not None:
+                    batch = batch.filter(predicate)
+                if remaining is not None:
+                    batch = batch.head(remaining)
+                    remaining -= batch.height
+                yield batch
+                if remaining == 0:
+                    return
 
-        placeholder = pl.DataFrame(schema=schema)
-        return placeholder.lazy().map_batches(
-            _load_batch,
+        return register_io_source(
+            _read_batches,
             schema=schema,
-            predicate_pushdown=False,
-            projection_pushdown=True,
-            slice_pushdown=False,
-            validate_output_schema=True,
-            streamable=False,
+            validate_schema=True,
         )
 
     def read(
