@@ -274,6 +274,42 @@ files had been used in earlier experiments, and "first pass" does not imply
 cold client or server caches. These timings exclude Python conversion and
 index serialization/publication.
 
+#### Object-ID reuse
+
+The production sibling parser now interns object paths once per file, reuses
+integer IDs for active raw metadata and object order, and caches resolved
+group/channel targets. Segment objects share canonical paths instead of
+rebuilding their strings and components on every appearance. This applies to
+both TDMS metadata scans and existing-index opens. The TDMS/index format and
+property/update semantics are unchanged. Streaming model construction is
+not included.
+
+A paired comparison loaded the previous and rebuilt production extensions in
+the same process. It used all 103 files in the supplied network folder and
+their local copies in `C:\temp\tmp`, with existing indexes, writing disabled,
+one warmup and three measured randomized before/after repeats per file:
+
+| Location | Previous: 103 indexed opens | Object-ID reuse | Speedup |
+|---|---:|---:|---:|
+| Network | 3.697 s | 1.377 s | 2.68x |
+| Local | 2.838 s | 0.741 s | 3.83x |
+
+Folder totals sum individual constructor times and report the median of the
+three repeats. They include native parsing, model construction and temporary
+segment cleanup, but exclude Python metadata conversion and comparison.
+Caches were not flushed; these are warm measurements, not cold-network claims.
+All 1,236 timed opens matched the previous extension's exposed metadata,
+properties, sample counts, dtypes and group/channel ordering. Original data
+files and index inventories, sizes and modification times were unchanged.
+
+The Rust regression generates a mixed file at runtime, checking reordered and
+late-added objects, metadata-only property updates, raw-index reuse,
+continuations, varied fragment sizes, padding, quoted slashes in paths, empty
+channels, six data types, exact fragment offsets and cross-fragment ranges.
+It covers direct reads, generated/verified indexes, and forced index-only
+reads. An independent nptdms read of the generated file also matched all
+30,482 samples across its nine channels.
+
 ### Scatter-gather experiment
 
 ```powershell
