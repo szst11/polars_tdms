@@ -1,6 +1,6 @@
 [project]
 name = "polars-tdms"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A polars IO extension for reading TDMS files, backed by tdms-rs (Rust)."
 readme = "README.md"
 requires-python = ">=3.14"

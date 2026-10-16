@@ -9,7 +9,7 @@ name = "_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py314"] }
 tdms-rs = { git = "https://github.com/szst11/tdms-rs.git", rev = "26d9911866f30b768c6c2ffe5f8f6e27f66baa0c" }
 #[patch."https://github.com/szst11/tdms-rs.git"]
 # Local fragment-index API; replace this patch with a published revision.
