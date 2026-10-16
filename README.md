@@ -160,6 +160,120 @@ parsing consistently, but a substantial reduction in first-index creation
 latency is not established. Metadata equality and `verify_index=True` passed
 for every measured open.
 
+#### Metadata read-ahead experiment
+
+An isolated release/LTO build of the actual `tdms-rs` parser compared 8 KiB,
+64 KiB, 256 KiB, 1 MiB, and 4 MiB metadata read buffers. Decoder and index-building
+logic were unchanged; only buffer capacity and benchmark-only file I/O counters
+varied. This experiment preceded the adaptive production policy below.
+
+The first-observed pass randomly allocated 95 distinct files larger than 20 MB
+from the supplied `F:` folder across the five capacities, with 19 files per
+capacity. Index usage and writing were disabled:
+
+| Read buffer | Median scan | Median read calls | Median seek calls | Median bytes fetched |
+|---|---:|---:|---:|---:|
+| 8 KiB | 668.1 ms | 1,067 | 717 | 8.73 MB |
+| 64 KiB | 252.4 ms | 300 | 192 | 19.57 MB |
+| 256 KiB | 221.3 ms | 81 | 76 | 20.94 MB |
+| 1 MiB | 187.8 ms | 23 | 19 | 22.06 MB |
+| 4 MiB | 199.5 ms | 7 | 4 | 22.14 MB |
+
+The 1 MiB buffer reduced the median first-observed scan by about 72% (3.56x).
+It fetched about 2.5x as many bytes to avoid hundreds of small reads and seeks.
+The 4 MiB result did not improve on 1 MiB. These are file API counters, not SMB
+request counts or measured network-wire throughput.
+
+Repeated scans randomized capacity order on the three previously used files,
+with 2 warmups and 13 measured repeats per file:
+
+| Read buffer | Warm unindexed median | Warm existing-index median |
+|---|---:|---:|
+| 8 KiB | 63.2 ms | 57.0 ms |
+| 64 KiB | 63.6 ms | 55.1 ms |
+| 256 KiB | 62.9 ms | 56.3 ms |
+| 1 MiB | 64.3 ms | 54.0 ms |
+| 4 MiB | 65.8 ms | 59.7 ms |
+
+Warm scans showed no comparable gain, consistent with parsing CPU cost becoming
+dominant. All 485 timed opens matched the 8 KiB baseline's full Rust metadata,
+including properties and raw-data locations. Original files, indexes, sizes,
+and modification times were unchanged.
+
+No shared caches were flushed: "first-observed" does not guarantee cold client
+or server caches. First-pass capacities used different randomized files rather
+than repeated cold reads of the same file. Timings measure Rust metadata open,
+not Python conversion or index creation. The result favors bounded 1 MiB
+read-ahead for this dense-segment network workload and motivated the adaptive
+policy below, including sparse/large-file amplification tests.
+
+#### Adaptive metadata read-ahead
+
+The sibling `tdms-rs` parser now chooses read-ahead from segment layout:
+
+- Start data-file metadata scans at 64 KiB.
+- After four consecutive data-bearing segments with raw-data skips of at most
+  64 KiB, use 1 MiB refills.
+- On a larger gap, immediately reduce future refills to 8 KiB, seek past the
+  gap, and require four nearby gaps before growing again.
+- Ignore metadata-only segments and incomplete final segments when training
+  the policy. Existing indexes use 1 MiB directly because their metadata is
+  contiguous.
+
+The allocation is bounded at 1 MiB per metadata scan. Only the refill limit
+changes, so unread buffered bytes and logical positions survive transitions
+without copying or repositioning the file. There is no drive-name detection,
+timing-based tuning, or new Python option.
+
+A temporary release/LTO benchmark used all 103 matching files in the supplied
+network folder and `C:\temp\tmp`, plus both copies of the supplied
+6,588,248,070-byte file in the network `test_data` folder and `C:\temp\large`.
+Index writing was disabled throughout. Medians:
+
+| Workload | Previous 8 KiB | Fixed 1 MiB | Adaptive |
+|---|---:|---:|---:|
+| Small files, network first pass | 708.7 ms | 134.7 ms | 137.5 ms |
+| Small files, local first pass | 202.9 ms | 52.3 ms | 54.6 ms |
+| Small files, network cached | 41.8 ms | 41.1 ms | 42.3 ms |
+| Small files, local cached | 34.7 ms | 37.2 ms | 37.2 ms |
+| Existing indexes, network cached | 36.1 ms | 37.3 ms | 39.4 ms |
+| Existing indexes, local cached | 30.0 ms | 31.4 ms | 31.0 ms |
+| Large file, network cached | 15.8 ms | 219.0 ms | 17.3 ms |
+| Large file, local cached | 12.6 ms | 284.3 ms | 13.3 ms |
+
+The first pass shuffled the 103 file pairs and assigned 35/34/34 pairs to the
+three variants, rather than repeatedly reading one supposedly cold file.
+Cached small-file/index measurements used three files per location, two
+warmups and seven measured repeats with randomized variant order. Large-file
+cached measurements used five randomized repeats per location. The fixed
+1 MiB variant happened to run first on each large-file copy; its initial
+3,432 ms network / 698 ms local times are not fair cold-cache comparisons
+against the later variants and are excluded from the table.
+
+For the fragmented small files, adaptive first-pass medians were about 5.15x
+faster on the network and 3.71x locally. Typical read/seek counts fell from
+1,067/717 to 27/23, at the cost of fetching about 22.1 MB instead of 8.7 MB.
+On the large file, 1,098 raw-data gaps exceeded 64 KiB, with a maximum around
+12.2 MB. Blind 1 MiB read-ahead fetched 1,125.1 MB; adaptive fetched 10.2 MB,
+close to the previous reader's 9.1 MB. Adaptation therefore avoids the severe
+sparse-file amplification, but retains a small overhead relative to 8 KiB.
+Cached scans and indexed opens did not show a consistent speedup and some
+were modestly slower; the policy is a latency/read-amplification compromise,
+not a guarantee of the globally fastest buffer.
+
+All 494 timed opens matched full baseline Rust metadata, including properties
+and raw locations; matching network/local copies also agreed. Fifteen parser
+source files, including decoder and metadata-building logic, were unchanged
+in the benchmark snapshot; only private benchmark hooks/counters differed.
+The rebuilt Python extension also matched nptdms on 48 first/middle/last
+numeric and string sample ranges covering all four supplied locations.
+Original file/index inventories, sizes and modification times were unchanged.
+Counters are file API reads/seeks and returned bytes, not SMB requests or
+network-wire bandwidth. No shared caches were flushed, the small network
+files had been used in earlier experiments, and "first pass" does not imply
+cold client or server caches. These timings exclude Python conversion and
+index serialization/publication.
+
 ### Scatter-gather experiment
 
 ```powershell
