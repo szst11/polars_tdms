@@ -32,7 +32,7 @@ print(meta.groups)          # [Group(name='...', channels=[...], ...), ...]
 df = pt.read_tdms("acquisition.tdms", group="DAQ")
 df.head()
 
-# lazy read → pl.LazyFrame  (projection / filter / slice pushed down)
+# lazy read → pl.LazyFrame (projection / filter / slice pushdown)
 lf = pt.scan_tdms("acquisition.tdms", group="DAQ", columns=["Ch0", "Ch1"])
 df = lf.filter(pl.col("Ch0") > 0.5).collect()
 
@@ -61,6 +61,32 @@ skipped when building frames.
 | `open_tdms(path)` | `TdmsSource` | Context manager for manual access to group/channel data. |
 
 `group=None` merges all groups (channels prefixed with `GroupName/`).
+
+### Streaming to Parquet
+
+```python
+lf = pt.scan_tdms("acquisition.tdms", group="DAQ", chunk_size=100_000)
+lf.select("Ch0", "Ch1").sink_parquet("acquisition.parquet", engine="streaming")
+```
+
+The TDMS scan is a batch-yielding Polars I/O source: it reads successive sample
+ranges and lets the streaming engine consume them without first materializing
+the entire selected file. Projection pushdown avoids reading unused channels;
+numeric channels retain coalesced reads, and strings and Booleans are batched
+too. Filters are evaluated per batch when pushed down, and pushed-down limits
+stop the source early.
+
+`chunk_size` caps each source batch in rows (default 1,000,000); Polars may
+request smaller batches. The engine and Parquet writer may buffer several
+batches, and string sizes vary, so this is not a fixed byte-memory limit.
+`chunk_size=None` or a nonpositive value explicitly requests a whole-file batch
+and disables bounded-memory source streaming. `row_group_size` controls Parquet
+row groups, not TDMS read batches.
+
+`collect()` still materializes the complete result. Blocking operations in a
+query can also retain data; lazy execution alone does not guarantee bounded
+memory. The scan uses Polars' public, currently unstable `register_io_source`
+API.
 
 ### `.tdms_index` companion files
 
