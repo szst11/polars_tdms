@@ -201,6 +201,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v7
       - name: Generate artifact attestation
         uses: actions/attest@v4
