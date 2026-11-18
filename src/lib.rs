@@ -67,7 +67,7 @@ fn property_to_py<'py>(py: Python<'py>, v: &PropertyValue) -> PyResult<Py<PyAny>
         }
         PropertyValue::String(s) => s.into_pyobject(py)?.into_any().unbind(),
         PropertyValue::TimeStamp((secs, frac)) => {
-            (*secs, *frac as i64).into_pyobject(py)?.into_any().unbind()
+            (*secs, *frac).into_pyobject(py)?.into_any().unbind()
         }
     })
 }
